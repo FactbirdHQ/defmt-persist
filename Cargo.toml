@@ -1,0 +1,12 @@
+[package]
+name = "defmt-persist"
+version = "0.1.0"
+authors = ["Mathias Koch <mk@blackbird.online>"]
+license = "MIT OR Apache-2.0"
+edition = "2018"
+
+
+[dependencies]
+defmt = { git = "https://github.com/knurling-rs/defmt", branch = "main" }
+cortex-m = "0.6.3"
+embedded-hal = { git = "https://github.com/tl8roy/embedded-hal", branch = "storage" }
