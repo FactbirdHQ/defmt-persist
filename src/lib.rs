@@ -1,25 +1,50 @@
-//! `defmt` global logger saving to storage
+//! `defmt` global logger saving to non-volatile storage
+//!
+//! This is built on the assumption that some persistent storage implements the
+//! traits from `embedded-hal::storage`, and that this logger has the full
+//! storage capacity from `StorageSize::try_start_address()` and
+//! `StorageSize::try_total_size()` words forward.
+//!
+//! In order to limit this, one can create a newtype wrapper that implements
+//! `StorageSize`, returning a subset of the full capacity.
+//!
 
 #![no_std]
 
+use bbqueue::{consts, BBBuffer, Consumer, Producer};
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering, AtomicUsize},
+    sync::atomic::{AtomicBool, Ordering},
 };
-
 use cortex_m::{interrupt, register};
 use embedded_hal::storage::*;
 
-// TODO make configurable
-// NOTE use a power of 2 for best performance
-const SIZE: usize = 1024;
+// TODO: How to make this length more generic?
+type LogBufferSize = consts::U256;
+type LogQueue = BBBuffer<LogBufferSize>;
+type LogProducer = Producer<'static, LogBufferSize>;
+type LogConsumer = Consumer<'static, LogBufferSize>;
+
+static mut PRODUCER: Option<LogProducer> = None;
 
 #[defmt::global_logger]
 struct Logger;
 
 impl defmt::Write for Logger {
     fn write(&mut self, bytes: &[u8]) {
-        unsafe { handle().write_all(bytes) }
+        match handle().grant_max_remaining(bytes.len()) {
+            Ok(mut grant) => {
+                let len = grant.buf().len();
+                if len < bytes.len() {
+                    panic!("LogQueue not big enough!");
+                }
+                grant.buf().copy_from_slice(&bytes[..len]);
+                grant.commit(len);
+            }
+            Err(_) => {
+                panic!("GrantInProgress!");
+            }
+        }
     }
 }
 
@@ -55,35 +80,39 @@ unsafe impl defmt::Logger for Logger {
     }
 }
 
+#[inline]
+pub fn init(buffer: &'static LogQueue) -> Result<LogDrain, ()> {
+    let (prod, cons) = buffer.try_split().map_err(drop)?;
+    unsafe { PRODUCER = Some(prod) }
+    Ok(LogDrain { inner: cons })
+}
 
-// make sure we only get shared references to the header/channel (avoid UB)
-/// # Safety
-/// `Channel` API is not re-entrant; this handle should not be held from different execution
-/// contexts (e.g. thread-mode, interrupt context)
-unsafe fn handle() -> &'static Channel {
-    // NOTE the `rtt-target` API is too permissive. It allows writing arbitrary data to any
-    // channel (`set_print_channel` + `rprint*`) and that can corrupt defmt log frames.
-    // So we declare the RTT control block here and make it impossible to use `rtt-target` together
-    // with this crate.
-    #[no_mangle]
-    static mut _SEGGER_RTT: Header = Header {
-        id: *b"SEGGER RTT\0\0\0\0\0\0",
-        max_up_channels: 1,
-        max_down_channels: 0,
-        up_channel: Channel {
-            name: NAME as *const _ as *const u8,
-            buffer: unsafe { &mut BUFFER as *mut _ as *mut u8 },
-            size: SIZE,
-            write: AtomicUsize::new(0),
-            read: AtomicUsize::new(0),
-            flags: 0b10, // mode = block-if-full
-        },
-    };
+/// Returns a reference to the storage.
+#[inline]
+fn handle() -> &'static mut LogProducer {
+    unsafe {
+        match PRODUCER {
+            Some(ref mut x) => x,
+            None => panic!(),
+        }
+    }
+}
 
-    #[link_section = ".uninit.defmt-rtt.BUFFER"]
-    static mut BUFFER: [u8; SIZE] = [0; SIZE];
+pub struct LogDrain {
+    inner: LogConsumer,
+}
 
-    static NAME: &[u8] = b"defmt\0";
-
-    &_SEGGER_RTT.up_channel
+impl LogDrain {
+    pub fn drain<S>(&mut self, mut storage: S) -> Result<(), ()>
+    where
+        S: MultiWrite<u8, u32> + StorageSize<u8, u32>,
+    {
+        match self.inner.read() {
+            Ok(mut grant) => {
+                // FIXME: Keep state of address and use `StorageSize` to calculate address every iteration
+                nb::block!(storage.try_write_slice(Address(1), grant.buf_mut())).map_err(drop)
+            }
+            Err(_e) => Err(()),
+        }
+    }
 }
