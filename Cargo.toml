@@ -6,10 +6,10 @@ license = "MIT OR Apache-2.0"
 edition = "2018"
 readme = "README.md"
 
-
 [dependencies]
 cortex-m = "0.6.3"
-embedded-hal = { git = "https://github.com/tl8roy/embedded-hal", branch = "storage" }
+embedded-hal = { path = "../embedded-hal" }
 defmt = { git = "https://github.com/knurling-rs/defmt", branch = "main" }
 bbqueue = "0.4.10"
 nb = "*"
+crc = { version = "1.8.1", default-features = false }
