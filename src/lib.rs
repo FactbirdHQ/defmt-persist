@@ -259,7 +259,7 @@ where
         self.header.write = self.header.write + data.len();
 
         // Persist the header
-        nb::block!(storage.try_write(header_start, &mut self.header.to_storage()))
+        nb::block!(storage.try_write(header_start, &self.header.to_storage()))
             .map_err(|_| Error::StorageWrite)
     }
 
@@ -288,7 +288,6 @@ where
         } else {
             start
         };
-
     }
 
     pub fn set_read_marker(&mut self, position: ReadMarker) {

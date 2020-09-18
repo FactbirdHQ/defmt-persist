@@ -6,7 +6,7 @@ pub struct CobsEncoder<'a> {
     code_idx: usize,
     num_bt_sent: u8,
     terminate: bool,
-    digest: Option<crc::crc16::Digest>
+    digest: Option<crc::crc16::Digest>,
 }
 
 impl<'a> CobsEncoder<'a> {
@@ -18,7 +18,11 @@ impl<'a> CobsEncoder<'a> {
             code_idx: 0,
             num_bt_sent: 1,
             terminate,
-            digest: if crc { Some(crc::crc16::Digest::new(0x8408)) } else { None }
+            digest: if crc {
+                Some(crc::crc16::Digest::new(0x8408))
+            } else {
+                None
+            },
         }
     }
 
@@ -81,7 +85,6 @@ impl<'a> CobsEncoder<'a> {
         Ok(self.dest_idx)
     }
 }
-
 
 #[derive(Debug)]
 pub struct CobsDecoder<'a> {
