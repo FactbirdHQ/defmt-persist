@@ -8,7 +8,7 @@
 //! In order to limit this, one can create a newtype wrapper that implements
 //! `StorageSize`, returning a subset of the full capacity.
 
-// #![no_std]
+#![no_std]
 
 pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
 use core::{
