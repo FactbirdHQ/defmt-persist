@@ -4,7 +4,7 @@
 ![No Std][no-std-badge]
 
 
-See https://github.com/BlackbirdHQ/meta/issues/1364 for more info.
+See https://github.com/BlackbirdHQ/defmt-persist/issues/7 for more info.
 
 
 <!-- Badges -->
