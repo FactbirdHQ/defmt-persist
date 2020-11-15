@@ -460,7 +460,12 @@ mod test {
         }
 
         fn try_erase(&mut self, from: Address, to: Address) -> nb::Result<(), Self::Error> {
-            self.inner.iter_mut().skip(from.0 as usize).take(to.0 as usize).map(|x| *x = 1).count();
+            self.inner
+                .iter_mut()
+                .skip(from.0 as usize)
+                .take(to.0 as usize)
+                .map(|x| *x = 1)
+                .count();
             Ok(())
         }
     }

@@ -1,12 +1,10 @@
+use crate::handle;
 pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
 use core::{
     ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering},
 };
 use cortex_m::{interrupt, register};
-use crate::handle;
-
-
 
 #[defmt::global_logger]
 pub struct Logger;

@@ -9,7 +9,12 @@ impl ReadWrite for StackStorage {
 
     fn try_read(&mut self, address: Address, bytes: &mut [u8]) -> nb::Result<(), Self::Error> {
         let addr = address.0 as usize;
-        defmt::warn!("Reading from log ({:?}-{:?}): {:?}", addr, bytes.len(), &self.buf[addr..addr+bytes.len()]);
+        defmt::warn!(
+            "Reading from log ({:?}-{:?}): {:?}",
+            addr,
+            bytes.len(),
+            &self.buf[addr..addr + bytes.len()]
+        );
 
         // assert!(addr <= self.buf.len());
         // let len = core::cmp::min(self.buf.len() - addr, bytes.len());
@@ -34,7 +39,11 @@ impl ReadWrite for StackStorage {
     }
 
     fn try_erase(&mut self, from: Address, to: Address) -> nb::Result<(), Self::Error> {
-        self.buf.iter_mut().skip(from.0 as usize).take(to.0 as usize).for_each(|x| *x = 1);
+        self.buf
+            .iter_mut()
+            .skip(from.0 as usize)
+            .take(to.0 as usize)
+            .for_each(|x| *x = 1);
         Ok(())
     }
 }
