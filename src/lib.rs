@@ -11,25 +11,34 @@
 #![no_std]
 
 pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
-use core::{
-    convert::TryInto,
-    ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
-};
-use cortex_m::{interrupt, register};
+use core::convert::TryInto;
 use embedded_hal::storage::{Address, ReadWrite};
 
 mod cobs;
-pub mod dummy;
+pub mod stack;
+
+#[cfg(feature = "rtt")]
+pub use defmt_rtt;
+
+#[cfg(not(feature = "rtt"))]
+mod producer;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Error {
+    StorageSize,
+    StorageRead,
+    StorageWrite,
+    BBBuffer,
+}
 
 // TODO: How to make this length more generic?
-type LogBufferSize = consts::U256;
+pub type LogBufferSize = consts::U256;
 
 pub type LogBuffer = BBBuffer<LogBufferSize>;
 
 static mut LOGPRODUCER: Option<LogProducer> = None;
 
-struct LogProducer {
+pub struct LogProducer {
     producer: Producer<'static, LogBufferSize>,
     encoder: Option<(GrantW<'static, LogBufferSize>, cobs::CobsEncoder<'static>)>,
 }
@@ -80,64 +89,20 @@ impl LogProducer {
     }
 }
 
-#[defmt::global_logger]
-struct Logger;
-
-impl defmt::Write for Logger {
-    // fn start_of_frame(&mut self, len: usize) {
-    //     handle().start_encoder(len).ok();
-    // }
-
-    // fn end_of_frame(&mut self) {
-    //     handle().finalize_encoder().ok();
-    // }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let handle = handle();
-        handle.start_encoder(bytes.len()).ok();
-        handle.encode(bytes).ok();
-        handle.finalize_encoder().ok();
-    }
+pub unsafe fn set_producer(prod: Producer<'static, LogBufferSize>) {
+    LOGPRODUCER = Some(LogProducer::new(prod))
 }
 
-static TAKEN: AtomicBool = AtomicBool::new(false);
-static INTERRUPTS_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-unsafe impl defmt::Logger for Logger {
-    fn acquire() -> Option<NonNull<dyn defmt::Write>> {
-        let primask = register::primask::read();
-        interrupt::disable();
-        if !TAKEN.load(Ordering::Relaxed) {
-            // no need for CAS because interrupts are disabled
-            TAKEN.store(true, Ordering::Relaxed);
-
-            INTERRUPTS_ACTIVE.store(primask.is_active(), Ordering::Relaxed);
-
-            Some(NonNull::from(&Logger as &dyn defmt::Write))
-        } else {
-            if primask.is_active() {
-                // re-enable interrupts
-                unsafe { interrupt::enable() }
-            }
-            None
+/// Returns a reference to the log producer.
+#[inline]
+pub fn handle() -> &'static mut LogProducer {
+    unsafe {
+        match LOGPRODUCER {
+            Some(ref mut x) => x,
+            // Should NEVER happen!
+            None => panic!(),
         }
     }
-
-    unsafe fn release(_: NonNull<dyn defmt::Write>) {
-        TAKEN.store(false, Ordering::Relaxed);
-        if INTERRUPTS_ACTIVE.load(Ordering::Relaxed) {
-            // re-enable interrupts
-            interrupt::enable()
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum Error {
-    StorageSize,
-    StorageRead,
-    StorageWrite,
-    BBBuffer,
 }
 
 // Implements a BIP style buffer ontop of a physical non-volatile storage,
@@ -268,11 +233,16 @@ where
             return Ok(0);
         }
 
+        let (_, end) = storage.range();
+
+        let read_end = if self.header.write > self.read_marker {
+            self.header.write
+        } else {
+            core::cmp::min(self.header.watermark, end)
+        };
+
         // Handle reading into smaller buffer than the available contigious data
-        let len = core::cmp::min(
-            data.len(),
-            (self.header.watermark - self.read_marker).0 as usize,
-        );
+        let len = core::cmp::min(data.len(), (read_end - self.read_marker).0 as usize);
 
         nb::block!(storage.try_read(self.read_marker, &mut data[..len]))
             .map_err(|_| Error::StorageRead)?;
@@ -298,18 +268,6 @@ where
     }
 }
 
-/// Returns a reference to the log producer.
-#[inline]
-fn handle() -> &'static mut LogProducer {
-    unsafe {
-        match LOGPRODUCER {
-            Some(ref mut x) => x,
-            // Should NEVER happen!
-            None => panic!(),
-        }
-    }
-}
-
 pub struct LogManager<S: ReadWrite> {
     inner: Consumer<'static, LogBufferSize>,
     helper: StorageHelper<S>,
@@ -319,6 +277,10 @@ impl<S> LogManager<S>
 where
     S: ReadWrite,
 {
+    /// Initialize a new LogManager.
+    ///
+    /// This function can only be called once, and will return `Error` if called
+    /// multiple times.
     pub fn try_new(
         buffer: &'static BBBuffer<LogBufferSize>,
         storage: &mut S,
@@ -326,7 +288,7 @@ where
         // NOTE: A `BBBuffer` can only be split once, which makes this function non-reentrant
         match buffer.try_split() {
             Ok((prod, cons)) => {
-                unsafe { LOGPRODUCER = Some(LogProducer::new(prod)) }
+                unsafe { set_producer(prod) };
                 Ok(Self {
                     inner: cons,
                     helper: StorageHelper::try_new(storage)?,
@@ -336,6 +298,12 @@ where
         }
     }
 
+    /// Drains the log buffer directly into a serial port.
+    ///
+    /// This function is mainly for debugging purposes.
+    ///
+    /// **NOTE**: This function is IO-heavy, and should ideally be called only
+    /// when the processor is otherwise idle.
     pub fn drain_serial<W: embedded_hal::serial::Write<u8>>(
         &mut self,
         serial: &mut W,
@@ -370,6 +338,10 @@ where
         }
     }
 
+    /// Drains the log buffer into persistent storage.
+    ///
+    /// **NOTE**: This function is IO-heavy, and should ideally be called only
+    /// when the processor is otherwise idle.
     pub fn drain_storage(&mut self, storage: &mut S) -> Result<usize, Error> {
         match self.inner.read() {
             Ok(mut grant) => {
@@ -384,30 +356,41 @@ where
         }
     }
 
-    pub fn retreive_storage(&mut self, storage: &mut S, buf: &mut [u8]) -> Result<usize, Error> {
+    /// Reads log frames from storage
+    ///
+    /// Pushes complete log frames into `buf` until a log frame can no longer
+    /// fit into `buf, or there is no more complete log frames available in
+    /// storage.
+    ///
+    /// Returns the number of bytes pushed to `buf`
+    pub fn retreive_frames(&mut self, storage: &mut S, buf: &mut [u8]) -> Result<usize, Error> {
         let read_len = self.helper.read_slice(storage, buf)?;
         if read_len == 0 {
             return Ok(0);
         }
-        let mut frames = buf[..read_len].split_mut(|x| *x == 0);
-        if let Some(frame) = frames.next() {
-            let frame_len = frame.len();
-            if let Ok(len) = cobs::decode_in_place(frame) {
-                self.helper.incr_read_marker(storage, frame_len + 1);
-                Ok(len)
-            } else {
-                Ok(0)
+
+        let mut frames = buf[..read_len].split_mut(|x| *x == 0).peekable();
+
+        let mut bytes_written = 0;
+
+        while let Some(frame) = frames.next() {
+            if frames.peek().is_some() {
+                // if frame.is_empty() {
+                //     continue;
+                // }
+                let frame_len = frame.len() + 1;
+                self.helper.incr_read_marker(storage, frame_len);
+                bytes_written += frame_len;
             }
-        } else {
-            // No frames at all!
-            Ok(0)
         }
+        Ok(bytes_written)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use core::ptr::NonNull;
 
     fn fill_data(data: &mut [u8]) {
         data.iter_mut()
@@ -417,7 +400,10 @@ mod test {
     }
 
     fn get_logger<'a>() -> Option<NonNull<dyn defmt::Write>> {
-        Some(NonNull::from(&Logger as &dyn defmt::Write))
+        #[cfg(not(feature = "rtt"))]
+        return Some(NonNull::from(&producer::Logger as &dyn defmt::Write));
+        #[cfg(feature = "rtt")]
+        None
     }
 
     struct TestStorage {
@@ -470,11 +456,11 @@ mod test {
         }
 
         fn range(&self) -> (Address, Address) {
-            (Address(0), Address(2048))
+            (Address(0), Address(self.inner.len() as u32))
         }
 
-        fn try_erase(&mut self) -> nb::Result<(), Self::Error> {
-            self.inner.iter_mut().map(|x| *x = 1).count();
+        fn try_erase(&mut self, from: Address, to: Address) -> nb::Result<(), Self::Error> {
+            self.inner.iter_mut().skip(from.0 as usize).take(to.0 as usize).map(|x| *x = 1).count();
             Ok(())
         }
     }
@@ -482,7 +468,8 @@ mod test {
     #[test]
     pub fn storage_helper() {
         let mut storage = TestStorage { inner: [0u8; 2048] };
-        storage.try_erase().unwrap();
+        let (from, to) = storage.range();
+        nb::block!(storage.try_erase(from, to)).unwrap();
 
         let mut helper = StorageHelper::try_new(&mut storage).unwrap();
 
@@ -506,7 +493,8 @@ mod test {
     #[test]
     pub fn dropped_header() {
         let mut storage = TestStorage { inner: [0u8; 2048] };
-        storage.try_erase().unwrap();
+        let (from, to) = storage.range();
+        nb::block!(storage.try_erase(from, to)).unwrap();
 
         let mut helper = StorageHelper::try_new(&mut storage).unwrap();
 
@@ -552,10 +540,11 @@ mod test {
     pub fn log_manager() {
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
         let mut storage = TestStorage { inner: [0u8; 2048] };
-        storage.try_erase().unwrap();
+        let (from, to) = storage.range();
+        nb::block!(storage.try_erase(from, to)).unwrap();
 
         let mut write_data = [0u8; 10];
-        let mut read_data = [0u8; 13];
+        let mut read_data = [0u8; 14];
         fill_data(&mut write_data);
 
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
@@ -564,18 +553,19 @@ mod test {
 
         log.drain_storage(&mut storage).unwrap();
 
-        let len = log.retreive_storage(&mut storage, &mut read_data).unwrap();
-        assert_eq!(&write_data[..], &read_data[..len - 2]);
+        let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
+        assert_eq!(&write_data[..], &read_data[1..len - 3]);
     }
 
     #[test]
     pub fn multiple_frames() {
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
         let mut storage = TestStorage { inner: [0u8; 2048] };
-        storage.try_erase().unwrap();
+        let (from, to) = storage.range();
+        nb::block!(storage.try_erase(from, to)).unwrap();
 
         let mut write_data = [0u8; 10];
-        let mut read_data = [0u8; 13];
+        let mut read_data = [0u8; 14];
         fill_data(&mut write_data);
 
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
@@ -589,13 +579,96 @@ mod test {
         assert_eq!(log.drain_storage(&mut storage).unwrap(), 0);
 
         for _ in 0..3 {
-            let len = log.retreive_storage(&mut storage, &mut read_data).unwrap();
-            assert_eq!(&write_data[..], &read_data[..len - 2]);
+            let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
+            assert_eq!(&write_data[..], &read_data[1..len - 3]);
         }
 
         assert_eq!(
-            log.retreive_storage(&mut storage, &mut read_data).unwrap(),
+            log.retreive_frames(&mut storage, &mut read_data).unwrap(),
             0
         );
+    }
+
+    #[test]
+    pub fn retreive_multiple_frames() {
+        static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
+        let mut storage = TestStorage { inner: [0u8; 2048] };
+        let (from, to) = storage.range();
+        nb::block!(storage.try_erase(from, to)).unwrap();
+
+        let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
+
+        unsafe { get_logger().unwrap().as_mut() }.write(&[1, 2, 3, 4]);
+        unsafe { get_logger().unwrap().as_mut() }.write(&[5, 6, 7, 8]);
+        unsafe { get_logger().unwrap().as_mut() }.write(&[9, 10, 11, 12]);
+
+        assert_eq!(log.drain_storage(&mut storage).unwrap(), 24);
+        log.helper
+            .write_slice(&mut storage, &mut [7, 13, 14])
+            .unwrap();
+
+        let mut read_data = [0u8; 128];
+
+        let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
+
+        assert_eq!(
+            &read_data[..len],
+            &[7, 1, 2, 3, 4, 145, 57, 0, 7, 5, 6, 7, 8, 16, 133, 0, 7, 9, 10, 11, 12, 3, 88, 0]
+        );
+        assert_eq!(len, 24);
+        assert_eq!(
+            log.helper.read_marker,
+            Address((len + Header::size()) as u32)
+        );
+        {
+            let mut read_data = [0u8; 128];
+            assert_eq!(
+                log.retreive_frames(&mut storage, &mut read_data).unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    pub fn retreive_multiple_frames_partially() {
+        static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
+        let mut storage = TestStorage { inner: [0u8; 2048] };
+        let (from, to) = storage.range();
+        nb::block!(storage.try_erase(from, to)).unwrap();
+
+        let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
+
+        unsafe { get_logger().unwrap().as_mut() }.write(&[1, 2, 3, 4]);
+        unsafe { get_logger().unwrap().as_mut() }.write(&[5, 6, 7, 8]);
+        unsafe { get_logger().unwrap().as_mut() }.write(&[9, 10, 11, 12]);
+
+        assert_eq!(log.drain_storage(&mut storage).unwrap(), 24);
+        log.helper
+            .write_slice(&mut storage, &mut [7, 13, 14])
+            .unwrap();
+
+        {
+            let mut read_data = [0u8; 10];
+            let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
+            assert_eq!(&read_data[..len], &[7, 1, 2, 3, 4, 145, 57, 0]);
+        }
+
+        {
+            let mut read_data = [0u8; 128];
+            let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
+            assert_eq!(
+                &read_data[..len],
+                &[7, 5, 6, 7, 8, 16, 133, 0, 7, 9, 10, 11, 12, 3, 88, 0]
+            );
+        }
+        assert_eq!(log.helper.read_marker, Address(36));
+
+        {
+            let mut read_data = [0u8; 128];
+            assert_eq!(
+                log.retreive_frames(&mut storage, &mut read_data).unwrap(),
+                0
+            );
+        }
     }
 }
