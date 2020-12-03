@@ -3,6 +3,7 @@
 ![Test][test]
 ![No Std][no-std-badge]
 
+** Very much WIP!** Contributions and suggestions more than welcome!
 
 See https://github.com/BlackbirdHQ/defmt-persist/issues/7 for more info.
 
