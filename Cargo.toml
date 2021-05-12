@@ -8,9 +8,10 @@ readme = "README.md"
 
 [dependencies]
 cortex-m = "0.6.3"
-embedded-hal = { git = "https://github.com/MathiasKoch/embedded-hal", branch = "feature/alternative-storage" }
-defmt = { version = "^0.1" }
-defmt-rtt = { version = "^0.1", optional = true }
+embedded-hal = { version = "1.0.0-alpha.4" }
+embedded-storage = { git = "https://github.com/rust-embedded-community/embedded-storage", branch = "storage-rework" }
+defmt = { version = "^0.2.1" }
+defmt-rtt = { version = "^0.2", optional = true }
 bbqueue = "0.4.10"
 nb = "*"
 crc = { version = "1.8.1", default-features = false }

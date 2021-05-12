@@ -9,6 +9,8 @@ use cortex_m::{interrupt, register};
 #[defmt::global_logger]
 pub struct Logger;
 
+defmt::timestamp!("");
+
 impl defmt::Write for Logger {
     // fn start_of_frame(&mut self, len: usize) {
     //     handle().start_encoder(len).ok();

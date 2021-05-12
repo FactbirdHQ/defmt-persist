@@ -2,17 +2,16 @@
 //!
 //! This is built on the assumption that some persistent storage implements the
 //! traits from `embedded-hal::storage`, and that this logger has the full
-//! storage capacity from `StorageSize::try_start_address()` and
+//! storage capacity from `StorageSize::try_start_)`and
 //! `StorageSize::try_total_size()` words forward.
 //!
 //! In order to limit this, one can create a newtype wrapper that implements
 //! `StorageSize`, returning a subset of the full capacity.
-
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
 use core::convert::TryInto;
-use embedded_hal::storage::{Address, ReadWrite};
+use embedded_storage::Storage;
 
 mod cobs;
 pub mod stack;
@@ -109,20 +108,20 @@ pub fn handle() -> &'static mut LogProducer {
 // implementing `embedded-hal::storage` traits, to be used as persistent log
 // storage.
 struct StorageHelper<S> {
-    read_marker: Address,
+    read_marker: u32,
     header: Header,
     _storage: core::marker::PhantomData<S>,
 }
 
 #[derive(Debug, PartialEq)]
 struct Header {
-    read: Address,
-    write: Address,
-    watermark: Address,
+    read: u32,
+    write: u32,
+    watermark: u32,
 }
 
 impl Header {
-    fn from_storage(buf: [u8; Self::size()], start: Address, end: Address) -> Self {
+    fn from_storage(buf: [u8; Self::size()], start: u32, end: u32) -> Self {
         Self {
             read: Header::sanity_check_addr(&buf[0..4], start, end),
             write: Header::sanity_check_addr(&buf[4..8], start, end),
@@ -137,21 +136,21 @@ impl Header {
     fn to_storage(&self) -> [u8; Self::size()] {
         let mut buf = [0u8; Self::size()];
 
-        buf[0..4].copy_from_slice(&self.read.0.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.write.0.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.watermark.0.to_le_bytes());
+        buf[0..4].copy_from_slice(&self.read.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.write.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.watermark.to_le_bytes());
 
         buf
     }
 
-    fn sanity_check_addr(buf: &[u8], start: Address, end: Address) -> Address {
+    fn sanity_check_addr(buf: &[u8], start: u32, end: u32) -> u32 {
         if buf.len() != 4 {
             return start;
         }
 
         match buf[0..4].try_into() {
             Ok(bytes) => {
-                let addr = Address(u32::from_le_bytes(bytes));
+                let addr = u32::from_le_bytes(bytes);
                 if addr >= start && addr <= end {
                     addr
                 } else {
@@ -170,16 +169,18 @@ pub enum ReadMarker {
 
 impl<S> StorageHelper<S>
 where
-    S: ReadWrite,
+    S: Storage,
 {
     pub fn try_new(storage: &mut S) -> Result<Self, Error> {
-        let (start, end) = storage.range();
+        let end = storage.capacity();
 
         // Restore header from storage
         let mut buf = [0u8; Header::size()];
-        nb::block!(storage.try_read(start, &mut buf)).map_err(|_| Error::StorageRead)?;
+        storage
+            .try_read(0, &mut buf)
+            .map_err(|_| Error::StorageRead)?;
 
-        let header = Header::from_storage(buf, start + Header::size(), end);
+        let header = Header::from_storage(buf, Header::size() as u32, end as u32);
 
         Ok(Self {
             read_marker: header.read,
@@ -189,13 +190,13 @@ where
     }
 
     pub fn write_slice(&mut self, storage: &mut S, data: &mut [u8]) -> Result<(), Error> {
-        let (header_start, end) = storage.range();
-        let start = header_start + Header::size();
+        let end = storage.capacity() as u32;
+        let start = Header::size() as u32;
 
         let len = data.len() as u32;
 
         // Obtain the address for the first byte of the current write, setting the watermark
-        let address = if len > (end - self.header.write).0 {
+        let address = if len > (end - self.header.write) {
             self.header.watermark = self.header.write;
             start
         } else {
@@ -203,13 +204,13 @@ where
         };
 
         // In these cases we will need to overwrite existing data by moving read
-        if self.header.write < self.header.read && (self.header.read - self.header.write).0 < len {
-            self.header.read = self.header.write + data.len();
+        if self.header.write < self.header.read && (self.header.read - self.header.write) < len {
+            self.header.read = self.header.write + data.len() as u32;
         } else if self.header.write > self.header.read
-            && len > (end - self.header.write).0
-            && len <= (self.header.read - start).0
+            && len > (end - self.header.write)
+            && len <= (self.header.read - start)
         {
-            self.header.read = start + data.len();
+            self.header.read = start + data.len() as u32;
         }
 
         // Reset watermark if read is incremented above watermark, and set read to start
@@ -218,13 +219,16 @@ where
             self.header.read = start;
         }
 
-        nb::block!(storage.try_write(address, data)).map_err(|_| Error::StorageWrite)?;
+        storage
+            .try_write(address, data)
+            .map_err(|_| Error::StorageWrite)?;
 
         // Increment the write pointer. now that the data is successfully written
-        self.header.write = self.header.write + data.len();
+        self.header.write = self.header.write + data.len() as u32;
 
         // Persist the header
-        nb::block!(storage.try_write(header_start, &self.header.to_storage()))
+        storage
+            .try_write(0, &self.header.to_storage())
             .map_err(|_| Error::StorageWrite)
     }
 
@@ -233,7 +237,7 @@ where
             return Ok(0);
         }
 
-        let (_, end) = storage.range();
+        let end = storage.capacity() as u32;
 
         let read_end = if self.header.write > self.read_marker {
             self.header.write
@@ -242,16 +246,17 @@ where
         };
 
         // Handle reading into smaller buffer than the available contigious data
-        let len = core::cmp::min(data.len(), (read_end - self.read_marker).0 as usize);
+        let len = core::cmp::min(data.len(), (read_end - self.read_marker) as usize);
 
-        nb::block!(storage.try_read(self.read_marker, &mut data[..len]))
+        storage
+            .try_read(self.read_marker, &mut data[..len])
             .map_err(|_| Error::StorageRead)?;
 
         Ok(len)
     }
 
-    pub fn incr_read_marker(&mut self, storage: &mut S, len: usize) {
-        let start = storage.range().0 + Header::size();
+    pub fn incr_read_marker(&mut self, storage: &mut S, len: u32) {
+        let start = Header::size() as u32;
         // Handle wrap around cases
         self.read_marker = if self.read_marker + len < self.header.watermark {
             self.read_marker + len
@@ -268,14 +273,14 @@ where
     }
 }
 
-pub struct LogManager<S: ReadWrite> {
+pub struct LogManager<S: Storage> {
     inner: Consumer<'static, LogBufferSize>,
     helper: StorageHelper<S>,
 }
 
 impl<S> LogManager<S>
 where
-    S: ReadWrite,
+    S: Storage,
 {
     /// Initialize a new LogManager.
     ///
@@ -340,7 +345,7 @@ where
 
     /// Drains the log buffer into persistent storage.
     ///
-    /// **NOTE**: This function is IO-heavy, and should ideally be called only
+    /// **NOTE**: This function may be IO-heavy, and should ideally be called only
     /// when the processor is otherwise idle.
     pub fn drain_storage(&mut self, storage: &mut S) -> Result<usize, Error> {
         match self.inner.read() {
@@ -379,7 +384,7 @@ where
                 //     continue;
                 // }
                 let frame_len = frame.len() + 1;
-                self.helper.incr_read_marker(storage, frame_len);
+                self.helper.incr_read_marker(storage, frame_len as u32);
                 bytes_written += frame_len;
             }
         }
@@ -389,6 +394,9 @@ where
 
 #[cfg(test)]
 mod test {
+    use embedded_storage::ReadStorage;
+
+    use crate::stack::StackStorage;
     use super::*;
     use core::ptr::NonNull;
 
@@ -406,75 +414,12 @@ mod test {
         None
     }
 
-    struct TestStorage {
-        inner: [u8; 2048],
-    }
-
-    impl ReadWrite for TestStorage {
-        type Error = ();
-
-        fn try_read(&mut self, address: Address, bytes: &mut [u8]) -> nb::Result<(), Self::Error> {
-            let addr = address.0 as usize;
-
-            if addr + bytes.len() > self.inner.len() {
-                return Err(nb::Error::Other(()));
-            }
-            bytes.copy_from_slice(
-                &self
-                    .inner
-                    .get(addr..addr + bytes.len())
-                    .ok_or_else(|| nb::Error::Other(()))?,
-            );
-            Ok(())
-        }
-
-        fn try_write(&mut self, address: Address, bytes: &[u8]) -> nb::Result<(), Self::Error> {
-            let addr = address.0 as usize;
-
-            let len = if bytes.len()
-                > self
-                    .inner
-                    .get(addr..)
-                    .ok_or_else(|| nb::Error::Other(()))?
-                    .len()
-            {
-                // Get max contiguous memory
-                self.inner
-                    .get(addr..)
-                    .ok_or_else(|| nb::Error::Other(()))?
-                    .len()
-            } else {
-                // Get requested length
-                bytes.len()
-            };
-
-            self.inner
-                .get_mut(addr..addr + len)
-                .ok_or_else(|| nb::Error::Other(()))?
-                .copy_from_slice(bytes);
-            Ok(())
-        }
-
-        fn range(&self) -> (Address, Address) {
-            (Address(0), Address(self.inner.len() as u32))
-        }
-
-        fn try_erase(&mut self, from: Address, to: Address) -> nb::Result<(), Self::Error> {
-            self.inner
-                .iter_mut()
-                .skip(from.0 as usize)
-                .take(to.0 as usize)
-                .map(|x| *x = 1)
-                .count();
-            Ok(())
-        }
-    }
-
     #[test]
     pub fn storage_helper() {
-        let mut storage = TestStorage { inner: [0u8; 2048] };
-        let (from, to) = storage.range();
-        nb::block!(storage.try_erase(from, to)).unwrap();
+        let mut storage = StackStorage {
+            buf: &mut [0u8; 2048],
+        };
+        let to = storage.capacity();
 
         let mut helper = StorageHelper::try_new(&mut storage).unwrap();
 
@@ -486,7 +431,7 @@ mod test {
         helper.write_slice(&mut storage, &mut write_data).unwrap();
 
         assert_eq!(
-            &storage.inner[Header::size()..Header::size() + write_data.len()],
+            &storage.buf[Header::size()..Header::size() + write_data.len()],
             &write_data[..]
         );
 
@@ -497,9 +442,9 @@ mod test {
 
     #[test]
     pub fn dropped_header() {
-        let mut storage = TestStorage { inner: [0u8; 2048] };
-        let (from, to) = storage.range();
-        nb::block!(storage.try_erase(from, to)).unwrap();
+        let mut storage = StackStorage {
+            buf: &mut [0u8; 2048],
+        };
 
         let mut helper = StorageHelper::try_new(&mut storage).unwrap();
 
@@ -513,14 +458,14 @@ mod test {
         assert_eq!(
             helper.header,
             Header {
-                read: Address(12),
-                write: Address(1012),
-                watermark: Address(2048)
+                read: 12,
+                write: 1012,
+                watermark: 2048
             }
         );
 
         assert_eq!(
-            &storage.inner[Header::size()..Header::size() + write_data.len()],
+            &storage.buf[Header::size()..Header::size() + write_data.len()],
             &write_data[..]
         );
 
@@ -531,9 +476,9 @@ mod test {
         assert_eq!(
             helper.header,
             Header {
-                read: Address(12),
-                write: Address(1012),
-                watermark: Address(2048)
+                read: 12,
+                write: 1012,
+                watermark: 2048
             }
         );
 
@@ -544,9 +489,9 @@ mod test {
     #[test]
     pub fn log_manager() {
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut storage = TestStorage { inner: [0u8; 2048] };
-        let (from, to) = storage.range();
-        nb::block!(storage.try_erase(from, to)).unwrap();
+        let mut storage = StackStorage {
+            buf: &mut [0u8; 2048],
+        };
 
         let mut write_data = [0u8; 10];
         let mut read_data = [0u8; 14];
@@ -565,9 +510,9 @@ mod test {
     #[test]
     pub fn multiple_frames() {
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut storage = TestStorage { inner: [0u8; 2048] };
-        let (from, to) = storage.range();
-        nb::block!(storage.try_erase(from, to)).unwrap();
+        let mut storage = StackStorage {
+            buf: &mut [0u8; 2048],
+        };
 
         let mut write_data = [0u8; 10];
         let mut read_data = [0u8; 14];
@@ -575,12 +520,14 @@ mod test {
 
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
 
+        
         // Write three frames of 10 bytes
         unsafe { get_logger().unwrap().as_mut() }.write(&write_data);
         unsafe { get_logger().unwrap().as_mut() }.write(&write_data);
         unsafe { get_logger().unwrap().as_mut() }.write(&write_data);
-
+        
         assert_eq!(log.drain_storage(&mut storage).unwrap(), 42);
+        dbg!(&storage.buf[0..64]);
         assert_eq!(log.drain_storage(&mut storage).unwrap(), 0);
 
         for _ in 0..3 {
@@ -597,9 +544,10 @@ mod test {
     #[test]
     pub fn retreive_multiple_frames() {
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut storage = TestStorage { inner: [0u8; 2048] };
-        let (from, to) = storage.range();
-        nb::block!(storage.try_erase(from, to)).unwrap();
+        let mut storage = StackStorage {
+            buf: &mut [0u8; 2048],
+        };
+        let to = storage.capacity();
 
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
 
@@ -621,10 +569,7 @@ mod test {
             &[7, 1, 2, 3, 4, 145, 57, 0, 7, 5, 6, 7, 8, 16, 133, 0, 7, 9, 10, 11, 12, 3, 88, 0]
         );
         assert_eq!(len, 24);
-        assert_eq!(
-            log.helper.read_marker,
-            Address((len + Header::size()) as u32)
-        );
+        assert_eq!(log.helper.read_marker, (len + Header::size()) as u32);
         {
             let mut read_data = [0u8; 128];
             assert_eq!(
@@ -637,9 +582,10 @@ mod test {
     #[test]
     pub fn retreive_multiple_frames_partially() {
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut storage = TestStorage { inner: [0u8; 2048] };
-        let (from, to) = storage.range();
-        nb::block!(storage.try_erase(from, to)).unwrap();
+        let mut storage = StackStorage {
+            buf: &mut [0u8; 2048],
+        };
+        let to = storage.capacity();
 
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
 
@@ -666,7 +612,7 @@ mod test {
                 &[7, 5, 6, 7, 8, 16, 133, 0, 7, 9, 10, 11, 12, 3, 88, 0]
             );
         }
-        assert_eq!(log.helper.read_marker, Address(36));
+        assert_eq!(log.helper.read_marker, 36);
 
         {
             let mut read_data = [0u8; 128];
