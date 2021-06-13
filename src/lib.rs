@@ -10,7 +10,6 @@
 #![cfg_attr(not(test), no_std)]
 
 pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
-use core::convert::TryInto;
 use embedded_storage::Storage;
 
 #[cfg(test)]
@@ -29,6 +28,13 @@ pub enum Error {
     StorageWrite,
     BBBuffer,
 }
+
+// We choose the COBS sentinel byte the same as an "empty" memory in FLASH
+// This should make it easier to find an empty space in the storage area
+const COBS_SENTINEL_BYTE: u8 = 0xFF;
+
+// Typical internal FLASH memory has 64-bit word (8 bytes)
+const WORD_SIZE_BYTES: usize = 8;
 
 // TODO: How to make this length more generic?
 pub type LogBufferSize = consts::U256;
@@ -54,15 +60,14 @@ impl LogProducer {
         if self.encoder.is_some() {
             return Err(());
         }
-        // NOTE: `max_encoding_length() + 3` to make room for a 16 bit crc and
-        // the sentinel value termination
+
         match self
             .producer
-            .grant_exact(cobs::max_encoding_length(len) + 3)
+            .grant_exact(cobs::max_encoding_length(len) + 1)
         {
             Ok(mut grant) => {
                 let buf = unsafe { grant.as_static_mut_buf() };
-                self.encoder = Some((grant, cobs::CobsEncoder::new(buf, true, true)));
+                self.encoder = Some((grant, cobs::CobsEncoder::new(buf)));
                 Ok(())
             }
             Err(_) => Err(()),
@@ -78,9 +83,17 @@ impl LogProducer {
     }
 
     pub fn finalize_encoder(&mut self) -> Result<(), ()> {
-        if let Some((grant, encoder)) = self.encoder.take() {
+        if let Some((mut grant, encoder)) = self.encoder.take() {
             let used = encoder.finalize()?;
-            grant.commit(used);
+
+            // Convert 0x00 sentinel into 0xFF sentinel by XORing
+            // See `cobs::encode_with_sentinel`
+            for b in grant.as_mut() {
+                *b ^= COBS_SENTINEL_BYTE;
+            }
+
+            grant.commit(used + 1);
+
             Ok(())
         } else {
             Err(())
@@ -104,62 +117,13 @@ pub fn handle() -> &'static mut LogProducer {
     }
 }
 
-// Implements a BIP style buffer ontop of a physical non-volatile storage,
+// Implements a BIP style buffer on top of a physical non-volatile storage,
 // implementing `embedded-hal::storage` traits, to be used as persistent log
 // storage.
 struct StorageHelper<S> {
-    read_marker: u32,
-    header: Header,
+    read_head: u32,
+    write_head: u32,
     _storage: core::marker::PhantomData<S>,
-}
-
-#[derive(Debug, PartialEq)]
-struct Header {
-    read: u32,
-    write: u32,
-    watermark: u32,
-}
-
-impl Header {
-    fn from_storage(buf: [u8; Self::size()], start: u32, end: u32) -> Self {
-        Self {
-            read: Header::sanity_check_addr(&buf[0..4], start, end),
-            write: Header::sanity_check_addr(&buf[4..8], start, end),
-            watermark: Header::sanity_check_addr(&buf[8..12], start, end),
-        }
-    }
-
-    const fn size() -> usize {
-        core::mem::size_of::<Header>()
-    }
-
-    fn to_storage(&self) -> [u8; Self::size()] {
-        let mut buf = [0u8; Self::size()];
-
-        buf[0..4].copy_from_slice(&self.read.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.write.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.watermark.to_le_bytes());
-
-        buf
-    }
-
-    fn sanity_check_addr(buf: &[u8], start: u32, end: u32) -> u32 {
-        if buf.len() != 4 {
-            return start;
-        }
-
-        match buf[0..4].try_into() {
-            Ok(bytes) => {
-                let addr = u32::from_le_bytes(bytes);
-                if addr >= start && addr <= end {
-                    addr
-                } else {
-                    start
-                }
-            }
-            Err(_) => start,
-        }
-    }
 }
 
 pub enum ReadMarker {
@@ -171,111 +135,129 @@ impl<S> StorageHelper<S>
 where
     S: Storage,
 {
+    const MAGIC_WORD: u64 = 0xFEED_BEEF_CAFE_BABE;
+    const EMPTY: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
     pub fn try_new(storage: &mut S) -> Result<Self, Error> {
-        let end = storage.capacity();
-
-        // Restore header from storage
-        let mut buf = [0u8; Header::size()];
-        storage
-            .try_read(0, &mut buf)
-            .map_err(|_| Error::StorageRead)?;
-
-        let header = Header::from_storage(buf, Header::size() as u32, end as u32);
+        // Check & write magic first
+        if !Self::check_magic(storage)? {
+            Self::write_magic(storage)?;
+        }
 
         Ok(Self {
-            read_marker: header.read,
-            header,
+            read_head: WORD_SIZE_BYTES as u32, // Skip magic
+            write_head: Self::seek_write_head(storage)?,
             _storage: core::marker::PhantomData,
         })
     }
 
-    pub fn write_slice(&mut self, storage: &mut S, data: &mut [u8]) -> Result<(), Error> {
-        let end = storage.capacity() as u32;
-        let start = Header::size() as u32;
+    pub fn write_slice(&mut self, storage: &mut S, data: &[u8]) -> Result<(), Error> {
+        let len = data.len();
 
-        let len = data.len() as u32;
+        if len % WORD_SIZE_BYTES == 0 {
+            storage
+                .try_write(self.write_head, data)
+                .map_err(|_| Error::StorageWrite)?;
 
-        // Obtain the address for the first byte of the current write, setting the watermark
-        let address = if len > (end - self.header.write) {
-            self.header.watermark = self.header.write;
-            start
+            self.write_head += len as u32;
         } else {
-            self.header.write
-        };
+            let bytes_within_word = len % WORD_SIZE_BYTES;
+            let last_word_index = len.saturating_sub(bytes_within_word);
 
-        // In these cases we will need to overwrite existing data by moving read
-        if self.header.write < self.header.read && (self.header.read - self.header.write) < len {
-            self.header.read = self.header.write + data.len() as u32;
-        } else if self.header.write > self.header.read
-            && len > (end - self.header.write)
-            && len <= (self.header.read - start)
-        {
-            self.header.read = start + data.len() as u32;
+            // Write words
+            if len - bytes_within_word > 0 {
+                storage
+                    .try_write(self.write_head, &data[..last_word_index])
+                    .map_err(|_| Error::StorageWrite)?;
+                self.write_head += last_word_index as u32;
+            }
+
+            // A small optimization for frequent writes:
+            // Avoid writing to the next word if we're currently at the last byte and it's 0xFF
+            // this will save us 7 bytes of storage for future writes
+            if bytes_within_word == 1 && data[last_word_index] == COBS_SENTINEL_BYTE {
+                self.write_head += 1;
+            } else {
+                let mut word_buf = [COBS_SENTINEL_BYTE; WORD_SIZE_BYTES]; // Fill the word with sentinels
+                word_buf[..bytes_within_word].copy_from_slice(&data[last_word_index..]);
+                storage
+                    .try_write(self.write_head as u32, &word_buf)
+                    .map_err(|_| Error::StorageWrite)?;
+
+                self.write_head += WORD_SIZE_BYTES as u32;
+            }
         }
 
-        // Reset watermark if read is incremented above watermark, and set read to start
-        if self.header.read >= self.header.watermark {
-            self.header.watermark = end;
-            self.header.read = start;
-        }
-
-        storage
-            .try_write(address, data)
-            .map_err(|_| Error::StorageWrite)?;
-
-        // Increment the write pointer. now that the data is successfully written
-        self.header.write = self.header.write + data.len() as u32;
-
-        // Persist the header
-        storage
-            .try_write(0, &self.header.to_storage())
-            .map_err(|_| Error::StorageWrite)
+        Ok(())
     }
 
     pub fn read_slice(&mut self, storage: &mut S, data: &mut [u8]) -> Result<usize, Error> {
-        if self.read_marker == self.header.write {
+        if self.read_head == self.write_head {
             return Ok(0);
         }
 
         let end = storage.capacity() as u32;
 
-        let read_end = if self.header.write > self.read_marker {
-            self.header.write
-        } else {
-            core::cmp::min(self.header.watermark, end)
-        };
-
         // Handle reading into smaller buffer than the available contigious data
-        let len = core::cmp::min(data.len(), (read_end - self.read_marker) as usize);
+        let len = core::cmp::min(data.len(), end.saturating_sub(self.read_head) as usize);
 
         storage
-            .try_read(self.read_marker, &mut data[..len])
+            .try_read(self.read_head, &mut data[..len])
             .map_err(|_| Error::StorageRead)?;
 
         Ok(len)
     }
 
-    pub fn incr_read_marker(&mut self, storage: &mut S, len: u32) {
-        let start = Header::size() as u32;
-        // Handle wrap around cases
-        self.read_marker = if self.read_marker + len < self.header.watermark {
-            self.read_marker + len
-        } else {
-            start
-        };
+    pub fn incr_read_marker(&mut self, storage: &mut S, inc: u32) {
+        if self.read_head + inc >= storage.capacity() as u32 {
+            self.read_head = storage.capacity() as u32;
+        }
+
+        self.read_head += inc;
     }
 
-    pub fn set_read_marker(&mut self, position: ReadMarker) {
-        self.read_marker = match position {
-            ReadMarker::Start => self.header.read,
-            ReadMarker::Tail => self.header.write,
-        };
+    pub fn decr_read_marker(&mut self, dec: u32) {
+        self.read_head = self.read_head.saturating_sub(dec);
+    }
+
+    fn check_magic(storage: &mut S) -> Result<bool, Error> {
+        let mut buf = [0u8; WORD_SIZE_BYTES];
+        storage.try_read(0, &mut buf).map_err(|_| Error::StorageRead)?;
+
+       Ok(u64::from_be_bytes(buf) == Self::MAGIC_WORD)
+    }
+
+    fn write_magic(storage: &mut S) -> Result<(), Error> {
+        storage
+            .try_write(0, &Self::MAGIC_WORD.to_be_bytes())
+            .map_err(|_| Error::StorageWrite)
+    }
+
+    fn seek_write_head(storage: &mut S) -> Result<u32, Error> {
+        if !Self::check_magic(storage)? {
+            return Ok(0)
+        }
+
+        // Magic found, let's look for the TWO empty words
+        for addr in (WORD_SIZE_BYTES..storage.capacity() as usize).step_by(WORD_SIZE_BYTES) {
+            let mut buf = [0u8; WORD_SIZE_BYTES];
+            storage.try_read(addr as u32, &mut buf).map_err(|_| Error::StorageRead)?;
+            let word1 = u64::from_le_bytes(buf);
+            storage.try_read((addr + WORD_SIZE_BYTES) as u32, &mut buf).map_err(|_| Error::StorageRead)?;
+            let word2 = u64::from_le_bytes(buf);
+
+            if word1 == Self::EMPTY && word2 == Self::EMPTY {
+                return Ok(addr as u32);
+            }
+        }
+
+        Ok(WORD_SIZE_BYTES as u32)
     }
 }
 
 pub struct LogManager<S: Storage> {
     inner: Consumer<'static, LogBufferSize>,
-    helper: StorageHelper<S>,
+    pub(crate) helper: StorageHelper<S>,
 }
 
 impl<S> LogManager<S>
@@ -345,6 +327,9 @@ where
 
     /// Drains the log buffer into persistent storage.
     ///
+    /// It's better to call this function as rare as possible as this may help to
+    /// use persistent storage memory more optimally.
+    ///
     /// **NOTE**: This function may be IO-heavy, and should ideally be called only
     /// when the processor is otherwise idle.
     pub fn drain_storage(&mut self, storage: &mut S) -> Result<usize, Error> {
@@ -368,22 +353,31 @@ where
     /// storage.
     ///
     /// Returns the number of bytes pushed to `buf`
-    pub fn retreive_frames(&mut self, storage: &mut S, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn retrieve_frames(&mut self, storage: &mut S, buf: &mut [u8]) -> Result<usize, Error> {
         let read_len = self.helper.read_slice(storage, buf)?;
         if read_len == 0 {
             return Ok(0);
         }
 
-        let mut frames = buf[..read_len].split_mut(|x| *x == 0).peekable();
-
+        let mut frames = buf[..read_len].split(|x| *x == COBS_SENTINEL_BYTE).peekable();
         let mut bytes_written = 0;
-
+        let mut num_empty_frames = 0;
         while let Some(frame) = frames.next() {
             if frames.peek().is_some() {
-                // if frame.is_empty() {
-                //     continue;
-                // }
                 let frame_len = frame.len() + 1;
+
+                if frame_len <= 1 {
+                    num_empty_frames += 1;
+                } else {
+                    num_empty_frames = 0;
+                }
+
+                if num_empty_frames >= WORD_SIZE_BYTES {
+                    self.helper.decr_read_marker((WORD_SIZE_BYTES - 1) as u32);
+                    bytes_written -= WORD_SIZE_BYTES - 1;
+                    break;
+                }
+
                 self.helper.incr_read_marker(storage, frame_len as u32);
                 bytes_written += frame_len;
             }
