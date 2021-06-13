@@ -392,13 +392,6 @@ mod test {
     use super::*;
     use core::ptr::NonNull;
 
-    fn fill_data(data: &mut [u8]) {
-        data.iter_mut()
-            .enumerate()
-            .map(|(i, x)| *x = i.wrapping_sub(usize::MAX) as u8)
-            .count();
-    }
-
     fn get_logger<'a>() -> Option<NonNull<dyn defmt::Write>> {
         #[cfg(not(feature = "rtt"))]
         return Some(NonNull::from(&producer::Logger as &dyn defmt::Write));
@@ -406,212 +399,223 @@ mod test {
         None
     }
 
-    #[test]
-    pub fn storage_helper() {
-        let mut storage = StackStorage {
-            buf: &mut [0u8; 2048],
-        };
-        let to = storage.capacity();
+    fn storage_to_str(storage: &PseudoFlashStorage, sh: &StorageHelper<PseudoFlashStorage>, num_bytes: usize) -> String {
+        use std::fmt::Write;
 
-        let mut helper = StorageHelper::try_new(&mut storage).unwrap();
+        let mut s = "".to_owned();
 
-        let mut write_data = [0u8; 1000];
-        let mut read_data = [0u8; 1000];
+        for i in (0..num_bytes).step_by(16) {
+            let mut bytes_str = "".to_owned();
 
-        fill_data(&mut write_data);
+            for (bi, byte) in storage.buf[i..(i + 16)].iter().enumerate() {
+                write!(bytes_str, "{:02X}", byte).ok();
 
-        helper.write_slice(&mut storage, &mut write_data).unwrap();
+                let has_write_head = sh.write_head == (i + bi) as u32;
+                let has_read_head = sh.read_head == (i + bi) as u32;
+                if has_read_head && has_write_head {
+                    write!(bytes_str, "b").ok();
+                } else if has_write_head {
+                    write!(bytes_str, "w").ok();
+                } else if has_read_head {
+                    write!(bytes_str, "r").ok();
+                } else {
+                    write!(bytes_str, " ").ok();
+                }
 
-        assert_eq!(
-            &storage.buf[Header::size()..Header::size() + write_data.len()],
-            &write_data[..]
-        );
+                write!(bytes_str, " ").ok();
 
-        helper.read_slice(&mut storage, &mut read_data).unwrap();
+                if (bi + 1) % WORD_SIZE_BYTES == 0 {
+                    write!(bytes_str, "|  ").ok();
+                }
+            }
 
-        assert_eq!(&write_data[..], &read_data[..]);
+            writeln!(s, "{}", bytes_str.trim()).ok();
+        }
+
+        s
+    }
+
+    fn assert_storage(storage: &PseudoFlashStorage, sh: &StorageHelper<PseudoFlashStorage>, dump: &str) {
+        // Remove starting whitespace
+        // This allows for better formatting of the dump in the assertion code
+        let dump = dump
+            .lines()
+            .map(str::trim_start)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
+        let num_lines = dump.len();
+        let dump = dump.join("\n");
+
+        let storage_str = storage_to_str(storage,sh, num_lines * 16);
+
+        if storage_str.trim() != dump.trim() {
+            eprintln!("Actual:");
+            eprintln!("{}", storage_str);
+
+            eprintln!();
+            eprintln!("Expected:");
+            eprintln!("{}", dump);
+
+            panic!("Dumps aren't equal");
+        }
     }
 
     #[test]
-    pub fn dropped_header() {
-        let mut storage = StackStorage {
-            buf: &mut [0u8; 2048],
+    fn write_read() {
+        let mut storage = PseudoFlashStorage {
+            buf: &mut [COBS_SENTINEL_BYTE; 128],
+            ..Default::default()
         };
 
-        let mut helper = StorageHelper::try_new(&mut storage).unwrap();
+        let mut sh = StorageHelper::try_new(&mut storage).unwrap();
 
-        let mut write_data = [0u8; 1000];
-        let mut read_data = [0u8; 1000];
+        // 1. Write some bytes but not the whole word (WORD_SIZE_BYTES),
+        // so the rest of the word will be filled with COBS_SENTINEL_BYTEs
+        sh.write_slice(&mut storage, &[
+            0x00, 0x11, 0x22, 0x33,
+        ]).unwrap();
 
-        fill_data(&mut write_data);
+        // 2. Write the whole word of WORD_SIZE_BYTES bytes,
+        // in this case, there shouldn't be any bytes written outside the word boundary
+        sh.write_slice(&mut storage, &[
+            0x00, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77,
+        ]).unwrap();
 
-        helper.write_slice(&mut storage, &mut write_data).unwrap();
+        // 3. Write more than one word of bytes, so it'll consume two words,
+        // but the second word will contain only a single byte
+        // and the rest of the word will be filled with COBS_SENTINEL_BYTEs
+        sh.write_slice(&mut storage, &[
+            0x00, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77,
+            0x88,
+        ]).unwrap();
 
-        assert_eq!(
-            helper.header,
-            Header {
-                read: 12,
-                write: 1012,
-                watermark: 2048
-            }
+        // Assert that data has been written properly and
+        // that write head (w) is at the end of the data, and
+        // that read head (r) is after the magic number that should be skipped
+        assert_storage(
+            &storage,
+            &sh, r#"
+                FE  ED  BE  EF  CA  FE  BA  BE  |  00r 11  22  33  FF  FF  FF  FF  |
+                00  11  22  33  44  55  66  77  |  00  11  22  33  44  55  66  77  |
+                88  FF  FF  FF  FF  FF  FF  FF  |  FFw FF  FF  FF  FF  FF  FF  FF  |
+            "#
         );
 
-        assert_eq!(
-            &storage.buf[Header::size()..Header::size() + write_data.len()],
-            &write_data[..]
+        // Check the case #1
+        let mut buf = [0u8; 24];
+        sh.read_slice(&mut storage, &mut buf[..WORD_SIZE_BYTES]).unwrap();
+        sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
+        assert!(matches!(buf, [ 0x00, 0x11, 0x22, 0x33, 0xFF, .. ]));
+
+        // Check the case #2
+        sh.read_slice(&mut storage, &mut buf).unwrap();
+        sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
+        assert!(matches!(buf, [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, ..
+        ]));
+
+        // Check the case #3
+        sh.read_slice(&mut storage, &mut buf).unwrap();
+        sh.incr_read_marker(&mut storage, (2 * WORD_SIZE_BYTES) as u32);
+        assert!(matches!(buf, [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0xFF, ..
+        ]));
+
+        // Both read and write heads are now at the same place (signified by b after FF)
+        assert_storage(
+            &storage,
+            &sh, r#"
+                FE  ED  BE  EF  CA  FE  BA  BE  |  00  11  22  33  FF  FF  FF  FF  |
+                00  11  22  33  44  55  66  77  |  00  11  22  33  44  55  66  77  |
+                88  FF  FF  FF  FF  FF  FF  FF  |  FFb FF  FF  FF  FF  FF  FF  FF  |
+            "#
         );
-
-        // Check that the header is correctly restored from storage
-        drop(helper);
-        let mut helper = StorageHelper::try_new(&mut storage).unwrap();
-
-        assert_eq!(
-            helper.header,
-            Header {
-                read: 12,
-                write: 1012,
-                watermark: 2048
-            }
-        );
-
-        helper.read_slice(&mut storage, &mut read_data).unwrap();
-        assert_eq!(&write_data[..], &read_data[..]);
     }
 
     #[test]
-    pub fn log_manager() {
+    fn helper_init() {
+        let mut storage = PseudoFlashStorage {
+            buf: &mut [COBS_SENTINEL_BYTE; 128],
+            ..Default::default()
+        };
+
+        // This will init the empty storage by
+        // 1. Writing the magic word as the first word
+        // 2. Writing some data that should go after the magic word
+        {
+            let mut sh = StorageHelper::try_new(&mut storage).unwrap();
+            sh.write_slice(&mut storage, &[
+                0x00, 0x11, 0x22, 0x33,
+            ]).unwrap();
+        }
+
+        // Now let's re-initialize the storage helper (to simulate restart)
+        let sh = StorageHelper::try_new(&mut storage).unwrap();
+
+        // Assert that data has been written properly and
+        // that write head (w) is at the end of the data, and
+        // that read head (r) is after the magic number that should be skipped
+        assert_storage(
+            &storage,
+            &sh, r#"
+                FE  ED  BE  EF  CA  FE  BA  BE  |  00r 11  22  33  FF  FF  FF  FF  |
+                FFw FF  FF  FF  FF  FF  FF  FF  |  FF  FF  FF  FF  FF  FF  FF  FF  |
+            "#
+        );
+    }
+
+    #[test]
+    fn log_manager() {
+        let mut storage = PseudoFlashStorage {
+            buf: &mut [COBS_SENTINEL_BYTE; 256],
+            ..Default::default()
+        };
+
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut storage = StackStorage {
-            buf: &mut [0u8; 2048],
-        };
-
-        let mut write_data = [0u8; 10];
-        let mut read_data = [0u8; 14];
-        fill_data(&mut write_data);
+        let mut read_data = [0x00; 256];
 
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
 
-        unsafe { get_logger().unwrap().as_mut() }.write(&write_data);
+        let frames = [
+            vec![0xFE_u8; 1],
+            vec![0xFD; 2],
+            vec![0xFC; 3],
+            vec![0xFB; 4],
+            vec![0xFA; 5],
+            vec![0xEF; 6],
+            vec![0xEE; 7],
+            vec![0xED; 8],
+            vec![0xEE; 7],
+            vec![0xEF; 6],
+            vec![0xFA; 5],
+            vec![0xFB; 4],
+            vec![0xFC; 3],
+            vec![0xFD; 2],
+            vec![0xFE; 1],
+        ];
 
+        for frame in frames.iter() {
+            unsafe { get_logger().unwrap().as_mut() }.write(frame);
+        }
         log.drain_storage(&mut storage).unwrap();
 
-        let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
-        assert_eq!(&write_data[..], &read_data[1..len - 3]);
-    }
+        let len = log.retrieve_frames(&mut storage, &mut read_data).unwrap();
 
-    #[test]
-    pub fn multiple_frames() {
-        static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut storage = StackStorage {
-            buf: &mut [0u8; 2048],
-        };
-
-        let mut write_data = [0u8; 10];
-        let mut read_data = [0u8; 14];
-        fill_data(&mut write_data);
-
-        let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
-
-        
-        // Write three frames of 10 bytes
-        unsafe { get_logger().unwrap().as_mut() }.write(&write_data);
-        unsafe { get_logger().unwrap().as_mut() }.write(&write_data);
-        unsafe { get_logger().unwrap().as_mut() }.write(&write_data);
-        
-        assert_eq!(log.drain_storage(&mut storage).unwrap(), 42);
-        dbg!(&storage.buf[0..64]);
-        assert_eq!(log.drain_storage(&mut storage).unwrap(), 0);
-
-        for _ in 0..3 {
-            let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
-            assert_eq!(&write_data[..], &read_data[1..len - 3]);
-        }
-
-        assert_eq!(
-            log.retreive_frames(&mut storage, &mut read_data).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    pub fn retreive_multiple_frames() {
-        static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut storage = StackStorage {
-            buf: &mut [0u8; 2048],
-        };
-        let to = storage.capacity();
-
-        let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
-
-        unsafe { get_logger().unwrap().as_mut() }.write(&[1, 2, 3, 4]);
-        unsafe { get_logger().unwrap().as_mut() }.write(&[5, 6, 7, 8]);
-        unsafe { get_logger().unwrap().as_mut() }.write(&[9, 10, 11, 12]);
-
-        assert_eq!(log.drain_storage(&mut storage).unwrap(), 24);
-        log.helper
-            .write_slice(&mut storage, &mut [7, 13, 14])
-            .unwrap();
-
-        let mut read_data = [0u8; 128];
-
-        let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
-
-        assert_eq!(
-            &read_data[..len],
-            &[7, 1, 2, 3, 4, 145, 57, 0, 7, 5, 6, 7, 8, 16, 133, 0, 7, 9, 10, 11, 12, 3, 88, 0]
-        );
-        assert_eq!(len, 24);
-        assert_eq!(log.helper.read_marker, (len + Header::size()) as u32);
+        let mut num_frames_read = 0;
+        for (i, frame) in read_data[..len]
+            .split_mut(|b| *b == COBS_SENTINEL_BYTE)
+            .filter(|f| f.len() > 1)
+            .enumerate()
         {
-            let mut read_data = [0u8; 128];
-            assert_eq!(
-                log.retreive_frames(&mut storage, &mut read_data).unwrap(),
-                0
-            );
-        }
-    }
-
-    #[test]
-    pub fn retreive_multiple_frames_partially() {
-        static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut storage = StackStorage {
-            buf: &mut [0u8; 2048],
-        };
-        let to = storage.capacity();
-
-        let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
-
-        unsafe { get_logger().unwrap().as_mut() }.write(&[1, 2, 3, 4]);
-        unsafe { get_logger().unwrap().as_mut() }.write(&[5, 6, 7, 8]);
-        unsafe { get_logger().unwrap().as_mut() }.write(&[9, 10, 11, 12]);
-
-        assert_eq!(log.drain_storage(&mut storage).unwrap(), 24);
-        log.helper
-            .write_slice(&mut storage, &mut [7, 13, 14])
-            .unwrap();
-
-        {
-            let mut read_data = [0u8; 10];
-            let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
-            assert_eq!(&read_data[..len], &[7, 1, 2, 3, 4, 145, 57, 0]);
+            let len = cobs::decode_in_place_with_sentinel(frame, COBS_SENTINEL_BYTE).unwrap();
+            assert_eq!(frames[i], frame[..len]);
+            num_frames_read += 1;
         }
 
-        {
-            let mut read_data = [0u8; 128];
-            let len = log.retreive_frames(&mut storage, &mut read_data).unwrap();
-            assert_eq!(
-                &read_data[..len],
-                &[7, 5, 6, 7, 8, 16, 133, 0, 7, 9, 10, 11, 12, 3, 88, 0]
-            );
-        }
-        assert_eq!(log.helper.read_marker, 36);
-
-        {
-            let mut read_data = [0u8; 128];
-            assert_eq!(
-                log.retreive_frames(&mut storage, &mut read_data).unwrap(),
-                0
-            );
-        }
+        assert_eq!(num_frames_read, frames.len(), "Not all of the frames were read");
     }
 }
