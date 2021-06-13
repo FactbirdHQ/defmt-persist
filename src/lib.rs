@@ -13,8 +13,8 @@ pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
 use core::convert::TryInto;
 use embedded_storage::Storage;
 
-mod cobs;
-pub mod stack;
+#[cfg(test)]
+pub mod pseudo_flash;
 
 #[cfg(feature = "rtt")]
 pub use defmt_rtt;
@@ -394,9 +394,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use embedded_storage::ReadStorage;
-
-    use crate::stack::StackStorage;
+    use crate::pseudo_flash::PseudoFlashStorage;
     use super::*;
     use core::ptr::NonNull;
 
