@@ -15,7 +15,7 @@ defmt-rtt = { version = "^0.2", optional = true }
 bbqueue = "0.4.10"
 nb = "*"
 crc = { version = "1.8.1", default-features = false }
-cobs = "0.1.4"
+cobs = { version = "0.1.4", default-features = false }
 
 [features]
 default = []
