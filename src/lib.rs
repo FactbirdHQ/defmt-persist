@@ -119,7 +119,7 @@ pub fn handle() -> &'static mut LogProducer {
 // Implements a BIP style buffer on top of a physical non-volatile storage,
 // implementing `embedded-hal::storage` traits, to be used as persistent log
 // storage.
-struct StorageHelper<S> {
+pub struct StorageHelper<S> {
     read_head: u32,
     write_head: u32,
     _storage: core::marker::PhantomData<S>,
