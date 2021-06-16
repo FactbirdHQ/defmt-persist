@@ -37,7 +37,9 @@ const COBS_SENTINEL_BYTE: u8 = 0xFF;
 const WORD_SIZE_BYTES: usize = 8;
 
 // TODO: How to make this length more generic?
-pub type LogBufferSize = consts::U256;
+pub type LogBufferSize = consts::U1024;
+
+pub const MAX_ENCODING_SIZE: usize = 512;
 
 pub type LogBuffer = BBBuffer<LogBufferSize>;
 
@@ -56,14 +58,14 @@ impl LogProducer {
         }
     }
 
-    pub fn start_encoder(&mut self, len: usize) -> Result<(), ()> {
+    pub fn start_encoder(&mut self) -> Result<(), ()> {
         if self.encoder.is_some() {
             return Err(());
         }
 
         match self
             .producer
-            .grant_exact(cobs::max_encoding_length(len) + 1)
+            .grant_exact(MAX_ENCODING_SIZE)
         {
             Ok(mut grant) => {
                 let buf = unsafe { grant.as_static_mut_buf() };
@@ -84,15 +86,15 @@ impl LogProducer {
 
     pub fn finalize_encoder(&mut self) -> Result<(), ()> {
         if let Some((mut grant, encoder)) = self.encoder.take() {
-            let used = encoder.finalize()?;
+            let len = encoder.finalize()? + 1;
 
             // Convert 0x00 sentinel into 0xFF sentinel by XORing
             // See `cobs::encode_with_sentinel`
-            for b in grant.as_mut() {
+            for b in &mut grant.as_mut()[..len] {
                 *b ^= COBS_SENTINEL_BYTE;
             }
 
-            grant.commit(used + 1);
+            grant.commit(len);
 
             Ok(())
         } else {
@@ -589,6 +591,9 @@ mod test {
             vec![0xEF; 6],
             vec![0xEE; 7],
             vec![0xED; 8],
+            vec![0xED; 9],
+            vec![0xED; 9],
+            vec![0xED; 8],
             vec![0xEE; 7],
             vec![0xEF; 6],
             vec![0xFA; 5],
@@ -599,7 +604,9 @@ mod test {
         ];
 
         for frame in frames.iter() {
+            handle().start_encoder().unwrap();
             unsafe { get_logger().unwrap().as_mut() }.write(frame);
+            handle().finalize_encoder().unwrap();
         }
         log.drain_storage(&mut storage).unwrap();
 

@@ -21,10 +21,7 @@ impl defmt::Write for Logger {
     // }
 
     fn write(&mut self, bytes: &[u8]) {
-        let handle = handle();
-        handle.start_encoder(bytes.len()).ok();
-        handle.encode(bytes).ok();
-        handle.finalize_encoder().ok();
+        handle().encode(bytes).expect("defmt write");
     }
 }
 
@@ -41,6 +38,8 @@ unsafe impl defmt::Logger for Logger {
 
             INTERRUPTS_ACTIVE.store(primask.is_active(), Ordering::Relaxed);
 
+            handle().start_encoder().expect("start encoder");
+
             Some(NonNull::from(&Logger as &dyn defmt::Write))
         } else {
             if primask.is_active() {
@@ -52,6 +51,8 @@ unsafe impl defmt::Logger for Logger {
     }
 
     unsafe fn release(_: NonNull<dyn defmt::Write>) {
+        handle().finalize_encoder().expect("finalize encoder");
+
         TAKEN.store(false, Ordering::Relaxed);
         if INTERRUPTS_ACTIVE.load(Ordering::Relaxed) {
             // re-enable interrupts
