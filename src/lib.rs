@@ -194,10 +194,6 @@ where
     }
 
     pub fn read_slice(&mut self, storage: &mut S, data: &mut [u8]) -> Result<usize, Error> {
-        if self.read_head == self.write_head {
-            return Ok(0);
-        }
-
         let end = storage.capacity() as u32;
 
         // Handle reading into smaller buffer than the available contigious data
@@ -356,7 +352,11 @@ where
     ///
     /// Returns the number of bytes pushed to `buf`
     pub fn retrieve_frames(&mut self, storage: &mut S, buf: &mut [u8]) -> Result<usize, Error> {
-        let read_len = self.helper.read_slice(storage, buf)?;
+        Self::retrieve_frames_helper(&mut self.helper, storage, buf)
+    }
+
+    pub fn retrieve_frames_helper(helper: &mut StorageHelper<S>, storage: &mut S, buf: &mut [u8]) -> Result<usize, Error> {
+        let read_len = helper.read_slice(storage, buf)?;
         if read_len == 0 {
             return Ok(0);
         }
@@ -374,8 +374,8 @@ where
                     num_empty_frames = 0;
                 }
 
-                if num_empty_frames >= WORD_SIZE_BYTES {
-                    self.helper.decr_read_marker((WORD_SIZE_BYTES - 1) as u32);
+                if num_empty_frames >= 8 {
+                    helper.decr_read_marker((WORD_SIZE_BYTES - 1) as u32);
                     bytes_written -= WORD_SIZE_BYTES - 1;
                     break;
                 }
