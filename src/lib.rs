@@ -63,10 +63,7 @@ impl LogProducer {
             return Err(());
         }
 
-        match self
-            .producer
-            .grant_exact(MAX_ENCODING_SIZE)
-        {
+        match self.producer.grant_exact(MAX_ENCODING_SIZE) {
             Ok(mut grant) => {
                 let buf = unsafe { grant.as_static_mut_buf() };
                 self.encoder = Some((grant, cobs::CobsEncoder::new(buf)));
@@ -220,9 +217,11 @@ where
 
     fn check_magic(storage: &mut S) -> Result<bool, Error> {
         let mut buf = [0u8; WORD_SIZE_BYTES];
-        storage.try_read(0, &mut buf).map_err(|_| Error::StorageRead)?;
+        storage
+            .try_read(0, &mut buf)
+            .map_err(|_| Error::StorageRead)?;
 
-       Ok(u64::from_be_bytes(buf) == Self::MAGIC_WORD)
+        Ok(u64::from_be_bytes(buf) == Self::MAGIC_WORD)
     }
 
     fn write_magic(storage: &mut S) -> Result<(), Error> {
@@ -233,15 +232,19 @@ where
 
     fn seek_write_head(storage: &mut S) -> Result<u32, Error> {
         if !Self::check_magic(storage)? {
-            return Ok(0)
+            return Ok(0);
         }
 
         // Magic found, let's look for the TWO empty words
         for addr in (WORD_SIZE_BYTES..storage.capacity() as usize).step_by(WORD_SIZE_BYTES) {
             let mut buf = [0u8; WORD_SIZE_BYTES];
-            storage.try_read(addr as u32, &mut buf).map_err(|_| Error::StorageRead)?;
+            storage
+                .try_read(addr as u32, &mut buf)
+                .map_err(|_| Error::StorageRead)?;
             let word1 = u64::from_le_bytes(buf);
-            storage.try_read((addr + WORD_SIZE_BYTES) as u32, &mut buf).map_err(|_| Error::StorageRead)?;
+            storage
+                .try_read((addr + WORD_SIZE_BYTES) as u32, &mut buf)
+                .map_err(|_| Error::StorageRead)?;
             let word2 = u64::from_le_bytes(buf);
 
             if word1 == Self::EMPTY && word2 == Self::EMPTY {
@@ -355,13 +358,19 @@ where
         Self::retrieve_frames_helper(&mut self.helper, storage, buf)
     }
 
-    pub fn retrieve_frames_helper(helper: &mut StorageHelper<S>, storage: &mut S, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn retrieve_frames_helper(
+        helper: &mut StorageHelper<S>,
+        storage: &mut S,
+        buf: &mut [u8],
+    ) -> Result<usize, Error> {
         let read_len = helper.read_slice(storage, buf)?;
         if read_len == 0 {
             return Ok(0);
         }
 
-        let mut frames = buf[..read_len].split(|x| *x == COBS_SENTINEL_BYTE).peekable();
+        let mut frames = buf[..read_len]
+            .split(|x| *x == COBS_SENTINEL_BYTE)
+            .peekable();
         let mut bytes_written = 0;
         let mut num_empty_frames = 0;
         while let Some(frame) = frames.next() {
@@ -380,7 +389,7 @@ where
                     break;
                 }
 
-                self.helper.incr_read_marker(storage, frame_len as u32);
+                helper.incr_read_marker(storage, frame_len as u32);
                 bytes_written += frame_len;
             }
         }
@@ -390,8 +399,8 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::pseudo_flash::PseudoFlashStorage;
     use super::*;
+    use crate::pseudo_flash::PseudoFlashStorage;
     use core::ptr::NonNull;
 
     fn get_logger<'a>() -> Option<NonNull<dyn defmt::Write>> {
@@ -401,7 +410,11 @@ mod test {
         None
     }
 
-    fn storage_to_str(storage: &PseudoFlashStorage, sh: &StorageHelper<PseudoFlashStorage>, num_bytes: usize) -> String {
+    fn storage_to_str(
+        storage: &PseudoFlashStorage,
+        sh: &StorageHelper<PseudoFlashStorage>,
+        num_bytes: usize,
+    ) -> String {
         use std::fmt::Write;
 
         let mut s = "".to_owned();
@@ -437,7 +450,11 @@ mod test {
         s
     }
 
-    fn assert_storage(storage: &PseudoFlashStorage, sh: &StorageHelper<PseudoFlashStorage>, dump: &str) {
+    fn assert_storage(
+        storage: &PseudoFlashStorage,
+        sh: &StorageHelper<PseudoFlashStorage>,
+        dump: &str,
+    ) {
         // Remove starting whitespace
         // This allows for better formatting of the dump in the assertion code
         let dump = dump
@@ -449,7 +466,7 @@ mod test {
         let num_lines = dump.len();
         let dump = dump.join("\n");
 
-        let storage_str = storage_to_str(storage,sh, num_lines * 16);
+        let storage_str = storage_to_str(storage, sh, num_lines * 16);
 
         if storage_str.trim() != dump.trim() {
             eprintln!("Actual:");
@@ -474,67 +491,83 @@ mod test {
 
         // 1. Write some bytes but not the whole word (WORD_SIZE_BYTES),
         // so the rest of the word will be filled with COBS_SENTINEL_BYTEs
-        sh.write_slice(&mut storage, &[
-            0x00, 0x11, 0x22, 0x33,
-        ]).unwrap();
+        sh.write_slice(&mut storage, &[0x00, 0x11, 0x22, 0x33])
+            .unwrap();
 
         // 2. Write the whole word of WORD_SIZE_BYTES bytes,
         // in this case, there shouldn't be any bytes written outside the word boundary
-        sh.write_slice(&mut storage, &[
-            0x00, 0x11, 0x22, 0x33,
-            0x44, 0x55, 0x66, 0x77,
-        ]).unwrap();
+        sh.write_slice(
+            &mut storage,
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+        )
+        .unwrap();
 
         // 3. Write more than one word of bytes, so it'll consume two words,
         // but the second word will contain only a single byte
         // and the rest of the word will be filled with COBS_SENTINEL_BYTEs
-        sh.write_slice(&mut storage, &[
-            0x00, 0x11, 0x22, 0x33,
-            0x44, 0x55, 0x66, 0x77,
-            0x88,
-        ]).unwrap();
+        sh.write_slice(
+            &mut storage,
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        )
+        .unwrap();
 
         // Assert that data has been written properly and
         // that write head (w) is at the end of the data, and
         // that read head (r) is after the magic number that should be skipped
         assert_storage(
             &storage,
-            &sh, r#"
+            &sh,
+            r#"
                 FE  ED  BE  EF  CA  FE  BA  BE  |  00r 11  22  33  FF  FF  FF  FF  |
                 00  11  22  33  44  55  66  77  |  00  11  22  33  44  55  66  77  |
                 88  FF  FF  FF  FF  FF  FF  FF  |  FFw FF  FF  FF  FF  FF  FF  FF  |
-            "#
+            "#,
         );
 
         // Check the case #1
         let mut buf = [0u8; 24];
-        sh.read_slice(&mut storage, &mut buf[..WORD_SIZE_BYTES]).unwrap();
+        sh.read_slice(&mut storage, &mut buf[..WORD_SIZE_BYTES])
+            .unwrap();
         sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
-        assert!(matches!(buf, [ 0x00, 0x11, 0x22, 0x33, 0xFF, .. ]));
+        assert!(matches!(buf, [0x00, 0x11, 0x22, 0x33, 0xFF, ..]));
 
         // Check the case #2
         sh.read_slice(&mut storage, &mut buf).unwrap();
         sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
-        assert!(matches!(buf, [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, ..
-        ]));
+        assert!(matches!(
+            buf,
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, ..]
+        ));
 
         // Check the case #3
         sh.read_slice(&mut storage, &mut buf).unwrap();
         sh.incr_read_marker(&mut storage, (2 * WORD_SIZE_BYTES) as u32);
-        assert!(matches!(buf, [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0xFF, ..
-        ]));
+        assert!(matches!(
+            buf,
+            [
+                0x00,
+                0x11,
+                0x22,
+                0x33,
+                0x44,
+                0x55,
+                0x66,
+                0x77,
+                0x88,
+                0xFF,
+                ..
+            ]
+        ));
 
         // Both read and write heads are now at the same place (signified by b after FF)
         assert_storage(
             &storage,
-            &sh, r#"
+            &sh,
+            r#"
                 FE  ED  BE  EF  CA  FE  BA  BE  |  00  11  22  33  FF  FF  FF  FF  |
                 00  11  22  33  44  55  66  77  |  00  11  22  33  44  55  66  77  |
                 88  FF  FF  FF  FF  FF  FF  FF  |  FFb FF  FF  FF  FF  FF  FF  FF  |
-            "#
+            "#,
         );
     }
 
@@ -550,9 +583,8 @@ mod test {
         // 2. Writing some data that should go after the magic word
         {
             let mut sh = StorageHelper::try_new(&mut storage).unwrap();
-            sh.write_slice(&mut storage, &[
-                0x00, 0x11, 0x22, 0x33,
-            ]).unwrap();
+            sh.write_slice(&mut storage, &[0x00, 0x11, 0x22, 0x33])
+                .unwrap();
         }
 
         // Now let's re-initialize the storage helper (to simulate restart)
@@ -563,10 +595,11 @@ mod test {
         // that read head (r) is after the magic number that should be skipped
         assert_storage(
             &storage,
-            &sh, r#"
+            &sh,
+            r#"
                 FE  ED  BE  EF  CA  FE  BA  BE  |  00r 11  22  33  FF  FF  FF  FF  |
                 FFw FF  FF  FF  FF  FF  FF  FF  |  FF  FF  FF  FF  FF  FF  FF  FF  |
-            "#
+            "#,
         );
     }
 
@@ -623,6 +656,10 @@ mod test {
             num_frames_read += 1;
         }
 
-        assert_eq!(num_frames_read, frames.len(), "Not all of the frames were read");
+        assert_eq!(
+            num_frames_read,
+            frames.len(),
+            "Not all of the frames were read"
+        );
     }
 }

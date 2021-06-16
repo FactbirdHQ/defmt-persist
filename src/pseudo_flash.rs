@@ -31,7 +31,7 @@ impl<'a> Storage for PseudoFlashStorage<'a> {
         // It isn't allowed by FLASH to write to the same word twice
         for wi in (addr..addr + bytes.len()).step_by(8).map(|a| a / 8) {
             if self.word_set.contains(&wi) {
-                return Err(())
+                return Err(());
             } else {
                 self.word_set.insert(wi);
             }
