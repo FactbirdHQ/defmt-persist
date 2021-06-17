@@ -9,8 +9,6 @@ use cortex_m::{interrupt, register};
 #[defmt::global_logger]
 pub struct Logger;
 
-defmt::timestamp!("");
-
 impl defmt::Write for Logger {
     fn write(&mut self, bytes: &[u8]) {
         handle().encode(bytes).expect("defmt write");
