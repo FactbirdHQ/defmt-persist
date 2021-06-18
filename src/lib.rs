@@ -47,7 +47,10 @@ static mut LOGPRODUCER: Option<LogProducer> = None;
 
 pub struct LogProducer {
     producer: Producer<'static, LogBufferSize>,
-    encoder: Option<(GrantW<'static, LogBufferSize>, rzcobs::Encoder<BufWriter<'static>>)>,
+    encoder: Option<(
+        GrantW<'static, LogBufferSize>,
+        rzcobs::Encoder<BufWriter<'static>>,
+    )>,
 }
 
 struct BufWriter<'a> {
@@ -57,10 +60,7 @@ struct BufWriter<'a> {
 
 impl<'a> BufWriter<'a> {
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self {
-            buf,
-            i: 0,
-        }
+        Self { buf, i: 0 }
     }
 }
 
@@ -69,7 +69,7 @@ impl<'a> rzcobs::Write for BufWriter<'a> {
 
     fn write(&mut self, byte: u8) -> Result<(), Self::Error> {
         if self.i + 1 >= self.buf.len() {
-            return Err(())
+            return Err(());
         }
 
         self.buf[self.i] = byte;
@@ -106,7 +106,7 @@ impl LogProducer {
         if let Some((_, ref mut encoder)) = self.encoder {
             for b in bytes {
                 if let Err(e) = encoder.write(*b) {
-                    return Err(e)
+                    return Err(e);
                 }
             }
 
