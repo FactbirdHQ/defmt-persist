@@ -47,7 +47,36 @@ static mut LOGPRODUCER: Option<LogProducer> = None;
 
 pub struct LogProducer {
     producer: Producer<'static, LogBufferSize>,
-    encoder: Option<(GrantW<'static, LogBufferSize>, cobs::CobsEncoder<'static>)>,
+    encoder: Option<(GrantW<'static, LogBufferSize>, rzcobs::Encoder<BufWriter<'static>>)>,
+}
+
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    i: usize,
+}
+
+impl<'a> BufWriter<'a> {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self {
+            buf,
+            i: 0,
+        }
+    }
+}
+
+impl<'a> rzcobs::Write for BufWriter<'a> {
+    type Error = ();
+
+    fn write(&mut self, byte: u8) -> Result<(), Self::Error> {
+        if self.i + 1 >= self.buf.len() {
+            return Err(())
+        }
+
+        self.buf[self.i] = byte;
+        self.i += 1;
+
+        Ok(())
+    }
 }
 
 impl LogProducer {
@@ -75,19 +104,30 @@ impl LogProducer {
 
     pub fn encode(&mut self, bytes: &[u8]) -> Result<(), ()> {
         if let Some((_, ref mut encoder)) = self.encoder {
-            encoder.push(bytes)
+            for b in bytes {
+                if let Err(e) = encoder.write(*b) {
+                    return Err(e)
+                }
+            }
+
+            Ok(())
         } else {
             Err(())
         }
     }
 
     pub fn finalize_encoder(&mut self) -> Result<(), ()> {
-        if let Some((mut grant, encoder)) = self.encoder.take() {
-            let len = encoder.finalize()? + 1;
+        if let Some((mut grant, mut encoder)) = self.encoder.take() {
+            let grant_buf = grant.as_mut();
+
+            encoder.end()?;
+            let last_encoded_byte = encoder.writer().i;
+            let len = last_encoded_byte + 1;
+            grant_buf[last_encoded_byte] = 0x00; // Terminator byte has to be written manually
 
             // Convert 0x00 sentinel into 0xFF sentinel by XORing
             // See `cobs::encode_with_sentinel`
-            for b in &mut grant.as_mut()[..len] {
+            for b in grant_buf {
                 *b ^= COBS_SENTINEL_BYTE;
             }
 
