@@ -661,7 +661,7 @@ mod test {
             }
             let frame = rzcobs::decode(frame).unwrap();
 
-            compare_with_redundant_zeros_ignored(&frames[i], &frame);
+            compare_with_trailing_zeros_ignored(&frames[i], &frame);
             num_frames_read += 1;
         }
 
@@ -672,16 +672,14 @@ mod test {
         );
     }
 
-    // Since rzCOBS has a lossy property that it's not possible to know how many
-    // 0x00 bytes were compressed at the end of the frame, to simply compare
-    // two slices of bytes we'll find a middle ground w.r.t. number of trailing zeros and
-    // cut the two slices there to have an equal length slices.
-    //
     // From rzCOBS docs:
     //    When a message is encoded and then decoded, the result is the original message, with up
     //    to 6 zero bytes appended.
     //    Higher layer protocols must be able to deal with these appended zero bytes.
-    fn compare_with_redundant_zeros_ignored(left: &[u8], right: &[u8]) {
+    //
+    // Compares two slices of bytes by finding a middle ground w.r.t. number of trailing zeros
+    // and cuts the two slices there to have an equal length slices.
+    fn compare_with_trailing_zeros_ignored(left: &[u8], right: &[u8]) {
         let zeros_left = left.iter().rev().filter(|b| **b == 0x00).count();
         let zeros_right = right.iter().rev().filter(|b| **b == 0x00).count();
         let zeros_middle = core::cmp::min(zeros_left, zeros_right);
