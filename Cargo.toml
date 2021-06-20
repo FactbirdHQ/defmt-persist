@@ -23,6 +23,7 @@ branch = "erasable-storage"
 
 [dev-dependencies]
 rzcobs = { version = "0.1.2", features = ["std"] }
+lazy_static = "1.4.0"
 
 [features]
 default = []

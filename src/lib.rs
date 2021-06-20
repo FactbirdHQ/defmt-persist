@@ -487,6 +487,14 @@ mod test {
     use super::*;
     use crate::pseudo_flash::PseudoFlashStorage;
     use core::ptr::NonNull;
+    use std::sync::Mutex;
+    use embedded_storage::{ErasableStorage, ReadStorage};
+    use lazy_static::lazy_static;
+
+    // Log manager tests have to run sequentially as they're accessing a global logger
+    lazy_static! {
+        static ref TEST_MUTEX: Mutex<()> = Mutex::new(());
+    }
 
     fn get_logger<'a>() -> Option<NonNull<dyn defmt::Write>> {
         #[cfg(not(feature = "rtt"))]
@@ -527,6 +535,11 @@ mod test {
                 if (bi + 1) % WORD_SIZE_BYTES == 0 {
                     write!(bytes_str, "|  ").ok();
                 }
+            }
+
+            // Draw page boundary
+            if i > 0 && i % PseudoFlashStorage::ERASE_SIZE as usize == 0 {
+                writeln!(s, "{}", "-".repeat(bytes_str.trim().len())).ok();
             }
 
             writeln!(s, "{}", bytes_str.trim()).ok();
@@ -611,13 +624,12 @@ mod test {
 
         // Check the case #1
         let mut buf = [0u8; 24];
-        sh.read_slice(&mut storage, &mut buf[..WORD_SIZE_BYTES])
-            .unwrap();
+        storage.try_read(sh.read_head, &mut buf[..WORD_SIZE_BYTES]).unwrap();
         sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
         assert!(matches!(buf, [0x00, 0x11, 0x22, 0x33, 0xFF, ..]));
 
         // Check the case #2
-        sh.read_slice(&mut storage, &mut buf).unwrap();
+        storage.try_read(sh.read_head, &mut buf).unwrap();
         sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
         assert!(matches!(
             buf,
@@ -625,7 +637,7 @@ mod test {
         ));
 
         // Check the case #3
-        sh.read_slice(&mut storage, &mut buf).unwrap();
+        storage.try_read(sh.read_head, &mut buf).unwrap();
         sh.incr_read_marker(&mut storage, (2 * WORD_SIZE_BYTES) as u32);
         assert!(matches!(
             buf,
@@ -689,14 +701,72 @@ mod test {
     }
 
     #[test]
-    fn log_manager() {
+    fn wrap_around() {
+        const NUM_PAGES: usize = 4;
+        const PAGE_SIZE: usize = PseudoFlashStorage::ERASE_SIZE as usize;
+
         let mut storage = PseudoFlashStorage {
-            buf: &mut [COBS_SENTINEL_BYTE; 256],
+            buf: &mut [COBS_SENTINEL_BYTE; PAGE_SIZE * NUM_PAGES],
+            ..Default::default()
+        };
+
+        let mut sh = StorageHelper::try_new(&mut storage).unwrap();
+
+        for i in 0..NUM_PAGES {
+            if i == 0 {
+                // Write the whole page except for bytes reserved for magic word
+                sh.write_slice(&mut storage, &[i as u8; PAGE_SIZE - WORD_SIZE_BYTES]).unwrap();
+            } else {
+                sh.write_slice(&mut storage, &[i as u8; PAGE_SIZE]).unwrap();
+            }
+        }
+
+        // Now trigger the very first wrap-around
+        sh.write_slice(&mut storage, &[0xAA; WORD_SIZE_BYTES]).unwrap();
+
+        // Write some data until we hit the next page which is filled with previous data
+        sh.write_slice(&mut storage, &[0xBB; PAGE_SIZE - 2 * WORD_SIZE_BYTES]).unwrap();
+
+        // Write some more data that won't fit since the page is filled,
+        // so the next page have to be erased
+        sh.write_slice(&mut storage, &[0xCC; 4]).unwrap();
+
+        sh.write_slice(&mut storage, &[0xDD; PAGE_SIZE / 2]).unwrap();
+
+        // Write something that won't fit the page so it has to be moved
+        // to the next page (and that page have to be erased first)
+        sh.write_slice(&mut storage, &[0xEE; PAGE_SIZE / 2]).unwrap();
+
+        // Reinitialize the storage to check how it finds the biggest empty area
+        // to place the writing head to
+        let mut sh = StorageHelper::try_new(&mut storage).unwrap();
+
+        // Write a ton of data to the storage, should wrap multiple times
+        // without any errors
+        for i in 1..254 {
+            sh.write_slice(&mut storage, &[i as u8; WORD_SIZE_BYTES]).unwrap();
+        }
+
+        // Test the whole page write one more
+        sh.write_slice(&mut storage, &[0x00; PAGE_SIZE]).unwrap();
+
+        // Some more data again
+        for _ in 1..16 {
+            sh.write_slice(&mut storage, &[0xAA as u8; WORD_SIZE_BYTES]).unwrap();
+        }
+    }
+
+    #[test]
+    fn log_manager() {
+        let _guard = TEST_MUTEX.lock().ok(); // Ensure that test is running sequentially
+
+        let mut storage = PseudoFlashStorage {
+            buf: &mut [COBS_SENTINEL_BYTE; 128],
             ..Default::default()
         };
 
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut read_data = [0x00; 256];
+        let mut read_data = [0x00; 1024];
 
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
 
@@ -755,6 +825,64 @@ mod test {
             frames.len(),
             "Not all of the frames were read"
         );
+    }
+
+
+    #[test]
+    fn log_manager_wrap() {
+        let _guard = TEST_MUTEX.lock().ok(); // Ensure that test is running sequentially
+
+        const NUM_PAGES: usize = 3;
+        const PAGE_SIZE: usize = PseudoFlashStorage::ERASE_SIZE as usize;
+
+        let mut storage = PseudoFlashStorage {
+            buf: &mut [COBS_SENTINEL_BYTE; PAGE_SIZE * NUM_PAGES],
+            ..Default::default()
+        };
+
+        static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
+        let mut read_data = [0x00; 1024];
+
+        unsafe { LOGPRODUCER = None; };
+        let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
+
+        let frames = [
+            vec![0x01; 30],
+            vec![0x02; 30],
+            vec![0x03; 30],
+            vec![0x04; 30],
+            vec![0x05; 30],
+            vec![0x06; 64],
+            vec![0x07; 64],
+            vec![0x08; 30],
+            vec![0x09; 30],
+            vec![0x0A; 30],
+            vec![0x0B; 30],
+            vec![0x0C; 30],
+        ];
+
+        for frame in frames.iter() {
+            handle().start_encoder().unwrap();
+            unsafe { get_logger().unwrap().as_mut() }.write(frame);
+            handle().finalize_encoder().unwrap();
+
+            log.drain_storage(&mut storage).unwrap();
+        }
+
+        let len = log.retrieve_frames(&mut storage, &mut read_data).unwrap();
+
+        let mut num_frames_read = 0;
+        for (i, frame) in read_data[..len]
+            .split_mut(|b| *b == COBS_SENTINEL_BYTE)
+            .filter(|f| f.len() >= 1)
+            .enumerate()
+        {
+            for b in frame.iter_mut() {
+                *b ^= 0xFF;
+            }
+
+            let frame = rzcobs::decode(frame).unwrap();
+        }
     }
 
     // From rzCOBS docs:
