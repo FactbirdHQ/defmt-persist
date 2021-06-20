@@ -10,13 +10,16 @@ resolver = "2"
 [dependencies]
 cortex-m = "0.6.3"
 embedded-hal = { version = "1.0.0-alpha.4" }
-embedded-storage = { git = "https://github.com/rust-embedded-community/embedded-storage" }
 defmt = { version = "^0.2.1" }
 defmt-rtt = { version = "^0.2", optional = true }
 bbqueue = "0.4.10"
 nb = "*"
 crc = { version = "1.8.1", default-features = false }
 rzcobs = { version = "0.1.2", default-features = false }
+
+[dependencies.embedded-storage]
+git = "https://github.com/eupn/embedded-storage"
+branch = "erasable-storage"
 
 [dev-dependencies]
 rzcobs = { version = "0.1.2", features = ["std"] }
