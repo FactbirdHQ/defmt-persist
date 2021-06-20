@@ -441,41 +441,43 @@ where
         Self::retrieve_frames_helper(&mut self.helper, storage, buf)
     }
 
+    /// Scans storage area for COBS-encoded frames.
+    /// Skips sequences of `COBS_SENTINEL_BYTE`s of any length.
+    ///
+    /// Due to possible wrapping during writes, the frames may appear in random order.
+    /// It is recommended for frames contain a timestamp and to be sorted using it by a host application.
     pub fn retrieve_frames_helper(
         helper: &mut StorageHelper<S>,
         storage: &mut S,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
-        let read_len = helper.read_slice(storage, buf)?;
-        if read_len == 0 {
-            return Ok(0);
-        }
-
-        let mut frames = buf[..read_len]
-            .split(|x| *x == COBS_SENTINEL_BYTE)
-            .peekable();
         let mut bytes_written = 0;
-        let mut num_empty_frames = 0;
-        while let Some(frame) = frames.next() {
-            if frames.peek().is_some() {
-                let frame_len = frame.len() + 1;
 
-                if frame_len <= 1 {
-                    num_empty_frames += 1;
-                } else {
-                    num_empty_frames = 0;
+        loop {
+            let current_addr = helper.read_head;
+
+            if !StorageHelper::is_word_empty(storage, current_addr)? {
+                let mut word_buf = [0u8; WORD_SIZE_BYTES];
+                let bytes_to_read = core::cmp::min(WORD_SIZE_BYTES, storage.capacity() - current_addr as usize);
+                storage.try_read(current_addr, &mut word_buf[..bytes_to_read]).map_err(|_| Error::StorageRead)?;
+                for bytes in word_buf
+                    .split_inclusive(|x| *x == COBS_SENTINEL_BYTE)
+                    .filter(|f| !f.is_empty()) {
+                    let len = bytes.len();
+                    buf[bytes_written .. (bytes_written + len)].copy_from_slice(&bytes);
+                    bytes_written += len;
                 }
 
-                if num_empty_frames >= 8 {
-                    helper.decr_read_marker((WORD_SIZE_BYTES - 1) as u32);
-                    bytes_written -= WORD_SIZE_BYTES - 1;
-                    break;
-                }
+                helper.incr_read_marker(storage, bytes_to_read as u32);
+            } else {
+                helper.incr_read_marker(storage, WORD_SIZE_BYTES as u32);
+            }
 
-                helper.incr_read_marker(storage, frame_len as u32);
-                bytes_written += frame_len;
+            if bytes_written >= buf.len() || current_addr + WORD_SIZE_BYTES as u32 >= storage.capacity() as u32 {
+                break;
             }
         }
+
         Ok(bytes_written)
     }
 }
