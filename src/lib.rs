@@ -191,57 +191,129 @@ where
         })
     }
 
+    /// Writes the data slice into the storage in circular buffer manner.
+    ///
+    /// Please note the following properties of this write:
+    /// - All the data slices are aligned at the word (`WORD_SIZE_BYTES`) boundary.
+    /// - The data slice size can't exceed the minimum erase size (page), otherwise it can't be
+    ///   guaranteed that data slice can fit wholly into a single page. Data slices have to fit
+    ///   in the pages wholly to guarantee that no data slices shall be cut or truncated when
+    ///   any of the pages are erased.
+    /// - If the data slice at the current write position shall span across the page boundary,
+    ///   then it shall be placed at the beginning of the next page.
+    /// - If data slice can't fit into the free storage area, the next page shall be erased
+    ///   and the slice shall be put at the beginning of the erased page.
+    /// - If the current page is the last one, then the very first page shall be erased.
+    ///   This provides the ability to wrap the storage around while keeping the most recent data
+    ///   slices.
     pub fn write_slice(&mut self, storage: &mut S, data: &[u8]) -> Result<(), Error> {
         let len = data.len();
+        let len_estimate = Self::estimate_frame_size_aligned(data);
+
+        assert!(len_estimate <= S::ERASE_SIZE as usize, "Data slice size can't be more than a minimum erase size");
+
+        // This write won't fit at the end of the storage,
+        // erase the first page and start from there
+        let mut write_pos = self.write_head;
+        if write_pos + len_estimate as u32 > storage.capacity() as u32 {
+            storage.try_erase(0, S::ERASE_SIZE - 1).map_err(|_| Error::StorageErase)?;
+            Self::write_magic(storage)?;
+            write_pos = Self::seek_write_head(storage)?;
+        }
+
+        // If this write spans across the page boundary, shift to the next page
+        let start_page_nr = write_pos / S::ERASE_SIZE;
+        let end_page_nr = (write_pos + len_estimate as u32 - 1) / S::ERASE_SIZE;
+        let spans_page_boundary = start_page_nr != end_page_nr;
+        if spans_page_boundary {
+            let curr_page = write_pos / S::ERASE_SIZE;
+            let next_page = curr_page + 1;
+
+            // Place the write position at the beginning of the next page
+            write_pos = next_page * S::ERASE_SIZE;
+        }
+
+        // Erase the page if there is some data that we'll bump into
+        if !Self::is_area_empty(storage, write_pos, write_pos + len_estimate as u32)? {
+            storage
+                .try_erase(write_pos, write_pos + len_estimate as u32 - 1)
+                .map_err(|_| Error::StorageErase)?;
+        }
+
+        // Write the data slice while respecting the word alignment
 
         if len % WORD_SIZE_BYTES == 0 {
             storage
-                .try_write(self.write_head, data)
+                .try_write(write_pos, data)
                 .map_err(|_| Error::StorageWrite)?;
 
-            self.write_head += len as u32;
+            write_pos += len as u32;
         } else {
             let bytes_within_word = len % WORD_SIZE_BYTES;
             let last_word_index = len.saturating_sub(bytes_within_word);
 
-            // Write words
+            // Write whole words
             if len - bytes_within_word > 0 {
                 storage
-                    .try_write(self.write_head, &data[..last_word_index])
+                    .try_write(write_pos, &data[..last_word_index])
                     .map_err(|_| Error::StorageWrite)?;
-                self.write_head += last_word_index as u32;
+                write_pos += last_word_index as u32;
             }
 
-            // A small optimization for frequent writes:
-            // Avoid writing to the next word if we're currently at the last byte and it's 0xFF
-            // this will save us 7 bytes of storage for future writes
-            if bytes_within_word == 1 && data[last_word_index] == COBS_SENTINEL_BYTE {
-                self.write_head += 1;
-            } else {
-                let mut word_buf = [COBS_SENTINEL_BYTE; WORD_SIZE_BYTES]; // Fill the word with sentinels
-                word_buf[..bytes_within_word].copy_from_slice(&data[last_word_index..]);
-                storage
-                    .try_write(self.write_head as u32, &word_buf)
-                    .map_err(|_| Error::StorageWrite)?;
+            // Write partial word
+            let mut word_buf = [COBS_SENTINEL_BYTE; WORD_SIZE_BYTES]; // Fill the word with sentinels
+            word_buf[..bytes_within_word].copy_from_slice(&data[last_word_index..]);
+            storage
+                .try_write(write_pos as u32, &word_buf)
+                .map_err(|_| Error::StorageWrite)?;
 
-                self.write_head += WORD_SIZE_BYTES as u32;
-            }
+            // Make sure that the next write will be aligned at the word boundary
+            write_pos += WORD_SIZE_BYTES as u32;
         }
+
+        self.write_head = write_pos;
 
         Ok(())
     }
 
-    pub fn read_slice(&mut self, storage: &mut S, data: &mut [u8]) -> Result<usize, Error> {
-        let end = storage.capacity() as u32;
+    fn estimate_frame_size_aligned(data: &[u8]) -> usize {
+        let len = data.len();
+        let mut result = 0;
 
-        // Handle reading into smaller buffer than the available contigious data
-        let len = core::cmp::min(data.len(), end.saturating_sub(self.read_head) as usize);
+        if len % WORD_SIZE_BYTES == 0 {
+            result = len;
+        } else {
+            let bytes_within_word = len % WORD_SIZE_BYTES;
+            let last_word_index = len.saturating_sub(bytes_within_word);
 
-        storage
-            .try_read(self.read_head, &mut data[..len])
-            .map_err(|_| Error::StorageRead)?;
+            if len - bytes_within_word > 0 {
+                result += last_word_index;
+            }
 
-        Ok(len)
+            if bytes_within_word == 1 && data[last_word_index] == COBS_SENTINEL_BYTE {
+                result += 1;
+            } else {
+                result += WORD_SIZE_BYTES;
+            }
+        }
+
+        result
+    }
+
+    fn is_area_empty(storage: &mut S, start: u32, end: u32) -> Result<bool, Error> {
+        for addr in (start..end).step_by(WORD_SIZE_BYTES) {
+            if !Self::is_word_empty(storage, addr)? {
+                return Ok(false)
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn is_word_empty(storage: &mut S, addr: u32) -> Result<bool, Error> {
+        let mut word_buf = [0u8; WORD_SIZE_BYTES];
+        storage.try_read(addr, &mut word_buf).map_err(|_| Error::StorageRead)?;
+        Ok(u64::from_le_bytes(word_buf) == Self::EMPTY)
     }
 
     pub fn incr_read_marker(&mut self, storage: &mut S, inc: u32) {
@@ -271,29 +343,39 @@ where
             .map_err(|_| Error::StorageWrite)
     }
 
+    // Finds the starting word address of the biggest empty area in O(n) time
     fn seek_write_head(storage: &mut S) -> Result<u32, Error> {
         if !Self::check_magic(storage)? {
             return Ok(0);
         }
 
-        // Magic found, let's look for the TWO empty words
-        for addr in (WORD_SIZE_BYTES..storage.capacity() as usize).step_by(WORD_SIZE_BYTES) {
-            let mut buf = [0u8; WORD_SIZE_BYTES];
-            storage
-                .try_read(addr as u32, &mut buf)
-                .map_err(|_| Error::StorageRead)?;
-            let word1 = u64::from_le_bytes(buf);
-            storage
-                .try_read((addr + WORD_SIZE_BYTES) as u32, &mut buf)
-                .map_err(|_| Error::StorageRead)?;
-            let word2 = u64::from_le_bytes(buf);
+        let mut max_empty_area_size = 0usize;
+        let mut max_empty_area_start_addr: Option<u32> = None;
+        let mut current_empty_area_size = 0usize;
+        let mut current_empty_area_addr = 0u32;
 
-            if word1 == Self::EMPTY && word2 == Self::EMPTY {
-                return Ok(addr as u32);
+        for addr in (WORD_SIZE_BYTES..storage.capacity() as usize).step_by(WORD_SIZE_BYTES) {
+            if Self::is_word_empty(storage, addr as u32)? {
+                if current_empty_area_size == 0 {
+                    current_empty_area_addr = addr as u32;
+                }
+
+                current_empty_area_size += 1;
+            } else {
+                current_empty_area_size = 0;
+            }
+
+            if current_empty_area_size > max_empty_area_size {
+                max_empty_area_start_addr = Some(current_empty_area_addr);
+                max_empty_area_size = current_empty_area_size;
             }
         }
 
-        Ok(WORD_SIZE_BYTES as u32)
+        if let Some(area_addr) = max_empty_area_start_addr {
+            Ok(area_addr)
+        } else {
+            Ok(WORD_SIZE_BYTES as u32)
+        }
     }
 }
 
