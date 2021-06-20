@@ -10,7 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
-use embedded_storage::Storage;
+use embedded_storage::{Storage, ErasableStorage};
 
 #[cfg(test)]
 pub mod pseudo_flash;
@@ -26,6 +26,7 @@ pub enum Error {
     StorageSize,
     StorageRead,
     StorageWrite,
+    StorageErase,
     BBBuffer,
 }
 
@@ -172,7 +173,7 @@ pub enum ReadMarker {
 
 impl<S> StorageHelper<S>
 where
-    S: Storage,
+    S: Storage + ErasableStorage,
 {
     const MAGIC_WORD: u64 = 0xFEED_BEEF_CAFE_BABE;
     const EMPTY: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -296,14 +297,14 @@ where
     }
 }
 
-pub struct LogManager<S: Storage> {
+pub struct LogManager<S: Storage + ErasableStorage> {
     inner: Consumer<'static, LogBufferSize>,
     pub(crate) helper: StorageHelper<S>,
 }
 
 impl<S> LogManager<S>
 where
-    S: Storage,
+    S: Storage + ErasableStorage,
 {
     /// Initialize a new LogManager.
     ///
