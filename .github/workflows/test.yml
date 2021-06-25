@@ -26,7 +26,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: build
-          args: --all --all-features --target thumbv7m-none-eabi
+          args: --lib --all-features --target thumbv7m-none-eabi
 
       - name: Test
         uses: actions-rs/cargo@v1
