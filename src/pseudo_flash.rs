@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use embedded_storage::{ReadStorage, ErasableStorage, Storage};
+use embedded_storage::{ErasableStorage, ReadStorage, Storage};
 use std::collections::HashSet;
 
 #[derive(Default)]
@@ -51,18 +51,21 @@ impl<'a> ErasableStorage for PseudoFlashStorage<'a> {
 
     fn try_erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
         if from % Self::ERASE_SIZE != 0 {
-            return Err(()) // Not aligned
+            return Err(()); // Not aligned
         }
 
         if to >= self.capacity() as u32 {
-            return Err(()) // Overflow
+            return Err(()); // Overflow
         }
 
         for page_addr in (from..=to).step_by(Self::ERASE_SIZE as usize) {
             let page_addr = page_addr as usize;
             self.buf[page_addr..(page_addr + Self::ERASE_SIZE as usize)].fill(0xFF);
 
-            for wi in (page_addr..(page_addr + Self::ERASE_SIZE as usize)).step_by(8).map(|a| a / 8) {
+            for wi in (page_addr..(page_addr + Self::ERASE_SIZE as usize))
+                .step_by(8)
+                .map(|a| a / 8)
+            {
                 self.word_set.remove(&wi);
             }
         }
@@ -112,12 +115,24 @@ mod test {
             let to = (PAGE_SIZE * (page_nr + 1)) as u32;
 
             storage.try_write(from, &[0x00; PAGE_SIZE]).unwrap();
-            assert!(storage.try_write(from, &[0x00; PAGE_SIZE]).is_err(), "can't write before erased");
-            assert!(storage.try_erase(from, to - 1).is_ok(), "can write after erase");
+            assert!(
+                storage.try_write(from, &[0x00; PAGE_SIZE]).is_err(),
+                "can't write before erased"
+            );
+            assert!(
+                storage.try_erase(from, to - 1).is_ok(),
+                "can write after erase"
+            );
             storage.try_write(from, &[0x00; PAGE_SIZE]).unwrap();
-            assert!(storage.try_write(from, &[0x00; PAGE_SIZE]).is_err(), "can't write before erased");
+            assert!(
+                storage.try_write(from, &[0x00; PAGE_SIZE]).is_err(),
+                "can't write before erased"
+            );
 
-            assert!(storage.try_erase(from + 1, to).is_err(), "can erase unaligned page");
+            assert!(
+                storage.try_erase(from + 1, to).is_err(),
+                "can erase unaligned page"
+            );
         }
     }
 }

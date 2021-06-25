@@ -10,7 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
-use embedded_storage::{Storage, ErasableStorage};
+use embedded_storage::{ErasableStorage, Storage};
 
 #[cfg(test)]
 pub mod pseudo_flash;
@@ -210,13 +210,18 @@ where
         let len = data.len();
         let len_estimate = Self::estimate_frame_size_aligned(data);
 
-        assert!(len_estimate <= S::ERASE_SIZE as usize, "Data slice size can't be more than a minimum erase size");
+        assert!(
+            len_estimate <= S::ERASE_SIZE as usize,
+            "Data slice size can't be more than a minimum erase size"
+        );
 
         // This write won't fit at the end of the storage,
         // erase the first page and start from there
         let mut write_pos = self.write_head;
         if write_pos + len_estimate as u32 > storage.capacity() as u32 {
-            storage.try_erase(0, S::ERASE_SIZE - 1).map_err(|_| Error::StorageErase)?;
+            storage
+                .try_erase(0, S::ERASE_SIZE - 1)
+                .map_err(|_| Error::StorageErase)?;
             Self::write_magic(storage)?;
             write_pos = Self::seek_write_head(storage)?;
         }
@@ -303,7 +308,7 @@ where
     fn is_area_empty(storage: &mut S, start: u32, end: u32) -> Result<bool, Error> {
         for addr in (start..end).step_by(WORD_SIZE_BYTES) {
             if !Self::is_word_empty(storage, addr)? {
-                return Ok(false)
+                return Ok(false);
             }
         }
 
@@ -312,7 +317,9 @@ where
 
     fn is_word_empty(storage: &mut S, addr: u32) -> Result<bool, Error> {
         let mut word_buf = [0u8; WORD_SIZE_BYTES];
-        storage.try_read(addr, &mut word_buf).map_err(|_| Error::StorageRead)?;
+        storage
+            .try_read(addr, &mut word_buf)
+            .map_err(|_| Error::StorageRead)?;
         Ok(u64::from_le_bytes(word_buf) == Self::EMPTY)
     }
 
@@ -458,13 +465,17 @@ where
 
             if !StorageHelper::is_word_empty(storage, current_addr)? {
                 let mut word_buf = [0u8; WORD_SIZE_BYTES];
-                let bytes_to_read = core::cmp::min(WORD_SIZE_BYTES, storage.capacity() - current_addr as usize);
-                storage.try_read(current_addr, &mut word_buf[..bytes_to_read]).map_err(|_| Error::StorageRead)?;
+                let bytes_to_read =
+                    core::cmp::min(WORD_SIZE_BYTES, storage.capacity() - current_addr as usize);
+                storage
+                    .try_read(current_addr, &mut word_buf[..bytes_to_read])
+                    .map_err(|_| Error::StorageRead)?;
                 for bytes in word_buf
                     .split_inclusive(|x| *x == COBS_SENTINEL_BYTE)
-                    .filter(|f| !f.is_empty()) {
+                    .filter(|f| !f.is_empty())
+                {
                     let len = bytes.len();
-                    buf[bytes_written .. (bytes_written + len)].copy_from_slice(&bytes);
+                    buf[bytes_written..(bytes_written + len)].copy_from_slice(&bytes);
                     bytes_written += len;
                 }
 
@@ -473,7 +484,9 @@ where
                 helper.incr_read_marker(storage, WORD_SIZE_BYTES as u32);
             }
 
-            if bytes_written >= buf.len() || current_addr + WORD_SIZE_BYTES as u32 >= storage.capacity() as u32 {
+            if bytes_written >= buf.len()
+                || current_addr + WORD_SIZE_BYTES as u32 >= storage.capacity() as u32
+            {
                 break;
             }
         }
@@ -487,9 +500,9 @@ mod test {
     use super::*;
     use crate::pseudo_flash::PseudoFlashStorage;
     use core::ptr::NonNull;
-    use std::sync::Mutex;
     use embedded_storage::{ErasableStorage, ReadStorage};
     use lazy_static::lazy_static;
+    use std::sync::Mutex;
 
     // Log manager tests have to run sequentially as they're accessing a global logger
     lazy_static! {
@@ -624,7 +637,9 @@ mod test {
 
         // Check the case #1
         let mut buf = [0u8; 24];
-        storage.try_read(sh.read_head, &mut buf[..WORD_SIZE_BYTES]).unwrap();
+        storage
+            .try_read(sh.read_head, &mut buf[..WORD_SIZE_BYTES])
+            .unwrap();
         sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
         assert!(matches!(buf, [0x00, 0x11, 0x22, 0x33, 0xFF, ..]));
 
@@ -715,27 +730,32 @@ mod test {
         for i in 0..NUM_PAGES {
             if i == 0 {
                 // Write the whole page except for bytes reserved for magic word
-                sh.write_slice(&mut storage, &[i as u8; PAGE_SIZE - WORD_SIZE_BYTES]).unwrap();
+                sh.write_slice(&mut storage, &[i as u8; PAGE_SIZE - WORD_SIZE_BYTES])
+                    .unwrap();
             } else {
                 sh.write_slice(&mut storage, &[i as u8; PAGE_SIZE]).unwrap();
             }
         }
 
         // Now trigger the very first wrap-around
-        sh.write_slice(&mut storage, &[0xAA; WORD_SIZE_BYTES]).unwrap();
+        sh.write_slice(&mut storage, &[0xAA; WORD_SIZE_BYTES])
+            .unwrap();
 
         // Write some data until we hit the next page which is filled with previous data
-        sh.write_slice(&mut storage, &[0xBB; PAGE_SIZE - 2 * WORD_SIZE_BYTES]).unwrap();
+        sh.write_slice(&mut storage, &[0xBB; PAGE_SIZE - 2 * WORD_SIZE_BYTES])
+            .unwrap();
 
         // Write some more data that won't fit since the page is filled,
         // so the next page have to be erased
         sh.write_slice(&mut storage, &[0xCC; 4]).unwrap();
 
-        sh.write_slice(&mut storage, &[0xDD; PAGE_SIZE / 2]).unwrap();
+        sh.write_slice(&mut storage, &[0xDD; PAGE_SIZE / 2])
+            .unwrap();
 
         // Write something that won't fit the page so it has to be moved
         // to the next page (and that page have to be erased first)
-        sh.write_slice(&mut storage, &[0xEE; PAGE_SIZE / 2]).unwrap();
+        sh.write_slice(&mut storage, &[0xEE; PAGE_SIZE / 2])
+            .unwrap();
 
         // Reinitialize the storage to check how it finds the biggest empty area
         // to place the writing head to
@@ -744,7 +764,8 @@ mod test {
         // Write a ton of data to the storage, should wrap multiple times
         // without any errors
         for i in 1..254 {
-            sh.write_slice(&mut storage, &[i as u8; WORD_SIZE_BYTES]).unwrap();
+            sh.write_slice(&mut storage, &[i as u8; WORD_SIZE_BYTES])
+                .unwrap();
         }
 
         // Test the whole page write one more
@@ -752,7 +773,8 @@ mod test {
 
         // Some more data again
         for _ in 1..16 {
-            sh.write_slice(&mut storage, &[0xAA as u8; WORD_SIZE_BYTES]).unwrap();
+            sh.write_slice(&mut storage, &[0xAA as u8; WORD_SIZE_BYTES])
+                .unwrap();
         }
     }
 
@@ -827,7 +849,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn log_manager_wrap() {
         let _guard = TEST_MUTEX.lock().ok(); // Ensure that test is running sequentially
@@ -843,7 +864,9 @@ mod test {
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
         let mut read_data = [0x00; 1024];
 
-        unsafe { LOGPRODUCER = None; };
+        unsafe {
+            LOGPRODUCER = None;
+        };
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
 
         let frames = [
