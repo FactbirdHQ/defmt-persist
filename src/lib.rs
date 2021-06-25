@@ -47,7 +47,36 @@ static mut LOGPRODUCER: Option<LogProducer> = None;
 
 pub struct LogProducer {
     producer: Producer<'static, LogBufferSize>,
-    encoder: Option<(GrantW<'static, LogBufferSize>, cobs::CobsEncoder<'static>)>,
+    encoder: Option<(
+        GrantW<'static, LogBufferSize>,
+        rzcobs::Encoder<BufWriter<'static>>,
+    )>,
+}
+
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    i: usize,
+}
+
+impl<'a> BufWriter<'a> {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, i: 0 }
+    }
+}
+
+impl<'a> rzcobs::Write for BufWriter<'a> {
+    type Error = ();
+
+    fn write(&mut self, byte: u8) -> Result<(), Self::Error> {
+        if self.i + 1 >= self.buf.len() {
+            return Err(());
+        }
+
+        self.buf[self.i] = byte;
+        self.i += 1;
+
+        Ok(())
+    }
 }
 
 impl LogProducer {
@@ -66,7 +95,7 @@ impl LogProducer {
         match self.producer.grant_exact(MAX_ENCODING_SIZE) {
             Ok(mut grant) => {
                 let buf = unsafe { grant.as_static_mut_buf() };
-                self.encoder = Some((grant, cobs::CobsEncoder::new(buf)));
+                self.encoder = Some((grant, rzcobs::Encoder::new(BufWriter::new(buf))));
                 Ok(())
             }
             Err(_) => Err(()),
@@ -75,19 +104,30 @@ impl LogProducer {
 
     pub fn encode(&mut self, bytes: &[u8]) -> Result<(), ()> {
         if let Some((_, ref mut encoder)) = self.encoder {
-            encoder.push(bytes)
+            for b in bytes {
+                if let Err(e) = encoder.write(*b) {
+                    return Err(e);
+                }
+            }
+
+            Ok(())
         } else {
             Err(())
         }
     }
 
     pub fn finalize_encoder(&mut self) -> Result<(), ()> {
-        if let Some((mut grant, encoder)) = self.encoder.take() {
-            let len = encoder.finalize()? + 1;
+        if let Some((mut grant, mut encoder)) = self.encoder.take() {
+            let grant_buf = grant.as_mut();
+
+            encoder.end()?;
+            let last_encoded_byte = encoder.writer().i;
+            let len = last_encoded_byte + 1;
+            grant_buf[last_encoded_byte] = 0x00; // Terminator byte has to be written manually
 
             // Convert 0x00 sentinel into 0xFF sentinel by XORing
             // See `cobs::encode_with_sentinel`
-            for b in &mut grant.as_mut()[..len] {
+            for b in grant_buf {
                 *b ^= COBS_SENTINEL_BYTE;
             }
 
@@ -283,46 +323,6 @@ where
                 })
             }
             Err(_e) => Err(Error::BBBuffer),
-        }
-    }
-
-    /// Drains the log buffer directly into a serial port.
-    ///
-    /// This function is mainly for debugging purposes.
-    ///
-    /// **NOTE**: This function is IO-heavy, and should ideally be called only
-    /// when the processor is otherwise idle.
-    pub fn drain_serial<W: embedded_hal::serial::Write<u8>>(
-        &mut self,
-        serial: &mut W,
-    ) -> Result<(), ()> {
-        match self.inner.read() {
-            Ok(mut grant) => {
-                let buf = grant.buf_mut();
-                let mut frames = buf.split_mut(|x| *x == 0).peekable();
-                let mut used = 0;
-                if frames.peek().is_some() {
-                    while match frames.next() {
-                        Some(f) if frames.peek().is_some() => {
-                            used += f.len();
-                            if let Ok(len) = cobs::decode_in_place(f) {
-                                for c in &f[..len] {
-                                    nb::block!(serial.try_write(*c)).map_err(|_| ()).ok();
-                                }
-                                nb::block!(serial.try_flush()).map_err(|_| ()).ok();
-                            }
-                            true
-                        }
-                        _ => false,
-                    } {}
-                } else {
-                    // No frames at all!
-                }
-
-                grant.release(used);
-                Ok(())
-            }
-            Err(_e) => Err(()),
         }
     }
 
@@ -616,14 +616,19 @@ mod test {
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
 
         let frames = [
-            vec![0xFE_u8; 1],
-            vec![0xFD; 2],
-            vec![0xFC; 3],
-            vec![0xFB; 4],
-            vec![0xFA; 5],
-            vec![0xEF; 6],
-            vec![0xEE; 7],
-            vec![0xED; 8],
+            vec![0x00; 1],
+            vec![0x00; 2],
+            vec![0x00; 3],
+            vec![0x00; 4],
+            vec![0x00; 5],
+            vec![0x00; 6],
+            vec![0x00; 7],
+            vec![0x00; 8],
+            vec![0x01, 0x00, 0x01, 0x00],
+            vec![0x00, 0x01, 0x00, 0x01],
+            vec![0x00, 0x01, 0x00, 0x00, 0x00, 0xFF],
+            vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF],
+            vec![0xFF_u8; 1],
             vec![0xED; 9],
             vec![0xED; 9],
             vec![0xED; 8],
@@ -648,11 +653,15 @@ mod test {
         let mut num_frames_read = 0;
         for (i, frame) in read_data[..len]
             .split_mut(|b| *b == COBS_SENTINEL_BYTE)
-            .filter(|f| f.len() > 1)
+            .filter(|f| f.len() >= 1)
             .enumerate()
         {
-            let len = cobs::decode_in_place_with_sentinel(frame, COBS_SENTINEL_BYTE).unwrap();
-            assert_eq!(frames[i], frame[..len]);
+            for b in frame.iter_mut() {
+                *b ^= 0xFF;
+            }
+            let frame = rzcobs::decode(frame).unwrap();
+
+            compare_with_trailing_zeros_ignored(&frames[i], &frame);
             num_frames_read += 1;
         }
 
@@ -661,5 +670,20 @@ mod test {
             frames.len(),
             "Not all of the frames were read"
         );
+    }
+
+    // From rzCOBS docs:
+    //    When a message is encoded and then decoded, the result is the original message, with up
+    //    to 6 zero bytes appended.
+    //    Higher layer protocols must be able to deal with these appended zero bytes.
+    //
+    // Compares two slices of bytes by finding a middle ground w.r.t. number of trailing zeros
+    // and cuts the two slices there to have an equal length slices.
+    fn compare_with_trailing_zeros_ignored(left: &[u8], right: &[u8]) {
+        let zeros_left = left.iter().rev().filter(|b| **b == 0x00).count();
+        let zeros_right = right.iter().rev().filter(|b| **b == 0x00).count();
+        let zeros_middle = core::cmp::min(zeros_left, zeros_right);
+
+        assert_eq!(left[..zeros_middle], right[..zeros_middle]);
     }
 }
