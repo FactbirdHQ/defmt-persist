@@ -10,7 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub use bbqueue::{consts, BBBuffer, ConstBBBuffer, Consumer, GrantW, Producer};
-use embedded_storage::Storage;
+use embedded_storage::{ErasableStorage, Storage};
 
 #[cfg(test)]
 pub mod pseudo_flash;
@@ -26,6 +26,7 @@ pub enum Error {
     StorageSize,
     StorageRead,
     StorageWrite,
+    StorageErase,
     BBBuffer,
 }
 
@@ -172,7 +173,7 @@ pub enum ReadMarker {
 
 impl<S> StorageHelper<S>
 where
-    S: Storage,
+    S: Storage + ErasableStorage,
 {
     const MAGIC_WORD: u64 = 0xFEED_BEEF_CAFE_BABE;
     const EMPTY: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -190,57 +191,136 @@ where
         })
     }
 
+    /// Writes the data slice into the storage in circular buffer manner.
+    ///
+    /// Please note the following properties of this write:
+    /// - All the data slices are aligned at the word (`WORD_SIZE_BYTES`) boundary.
+    /// - The data slice size can't exceed the minimum erase size (page), otherwise it can't be
+    ///   guaranteed that data slice can fit wholly into a single page. Data slices have to fit
+    ///   in the pages wholly to guarantee that no data slices shall be cut or truncated when
+    ///   any of the pages are erased.
+    /// - If the data slice at the current write position shall span across the page boundary,
+    ///   then it shall be placed at the beginning of the next page.
+    /// - If data slice can't fit into the free storage area, the next page shall be erased
+    ///   and the slice shall be put at the beginning of the erased page.
+    /// - If the current page is the last one, then the very first page shall be erased.
+    ///   This provides the ability to wrap the storage around while keeping the most recent data
+    ///   slices.
     pub fn write_slice(&mut self, storage: &mut S, data: &[u8]) -> Result<(), Error> {
         let len = data.len();
+        let len_estimate = Self::estimate_frame_size_aligned(data);
+
+        assert!(
+            len_estimate <= S::ERASE_SIZE as usize,
+            "Data slice size can't be more than a minimum erase size"
+        );
+
+        // This write won't fit at the end of the storage,
+        // erase the first page and start from there
+        let mut write_pos = self.write_head;
+        if write_pos + len_estimate as u32 > storage.capacity() as u32 {
+            storage
+                .try_erase(0, S::ERASE_SIZE - 1)
+                .map_err(|_| Error::StorageErase)?;
+            Self::write_magic(storage)?;
+            write_pos = Self::seek_write_head(storage)?;
+        }
+
+        // If this write spans across the page boundary, shift to the next page
+        let start_page_nr = write_pos / S::ERASE_SIZE;
+        let end_page_nr = (write_pos + len_estimate as u32 - 1) / S::ERASE_SIZE;
+        let spans_page_boundary = start_page_nr != end_page_nr;
+        if spans_page_boundary {
+            let curr_page = write_pos / S::ERASE_SIZE;
+            let next_page = curr_page + 1;
+
+            // Place the write position at the beginning of the next page
+            write_pos = next_page * S::ERASE_SIZE;
+        }
+
+        // Erase the page if there is some data that we'll bump into
+        if !Self::is_area_empty(storage, write_pos, write_pos + len_estimate as u32)? {
+            storage
+                .try_erase(write_pos, write_pos + len_estimate as u32 - 1)
+                .map_err(|_| Error::StorageErase)?;
+        }
+
+        // Write the data slice while respecting the word alignment
 
         if len % WORD_SIZE_BYTES == 0 {
             storage
-                .try_write(self.write_head, data)
+                .try_write(write_pos, data)
                 .map_err(|_| Error::StorageWrite)?;
 
-            self.write_head += len as u32;
+            write_pos += len as u32;
         } else {
             let bytes_within_word = len % WORD_SIZE_BYTES;
             let last_word_index = len.saturating_sub(bytes_within_word);
 
-            // Write words
+            // Write whole words
             if len - bytes_within_word > 0 {
                 storage
-                    .try_write(self.write_head, &data[..last_word_index])
+                    .try_write(write_pos, &data[..last_word_index])
                     .map_err(|_| Error::StorageWrite)?;
-                self.write_head += last_word_index as u32;
+                write_pos += last_word_index as u32;
             }
 
-            // A small optimization for frequent writes:
-            // Avoid writing to the next word if we're currently at the last byte and it's 0xFF
-            // this will save us 7 bytes of storage for future writes
-            if bytes_within_word == 1 && data[last_word_index] == COBS_SENTINEL_BYTE {
-                self.write_head += 1;
-            } else {
-                let mut word_buf = [COBS_SENTINEL_BYTE; WORD_SIZE_BYTES]; // Fill the word with sentinels
-                word_buf[..bytes_within_word].copy_from_slice(&data[last_word_index..]);
-                storage
-                    .try_write(self.write_head as u32, &word_buf)
-                    .map_err(|_| Error::StorageWrite)?;
+            // Write partial word
+            let mut word_buf = [COBS_SENTINEL_BYTE; WORD_SIZE_BYTES]; // Fill the word with sentinels
+            word_buf[..bytes_within_word].copy_from_slice(&data[last_word_index..]);
+            storage
+                .try_write(write_pos as u32, &word_buf)
+                .map_err(|_| Error::StorageWrite)?;
 
-                self.write_head += WORD_SIZE_BYTES as u32;
-            }
+            // Make sure that the next write will be aligned at the word boundary
+            write_pos += WORD_SIZE_BYTES as u32;
         }
+
+        self.write_head = write_pos;
 
         Ok(())
     }
 
-    pub fn read_slice(&mut self, storage: &mut S, data: &mut [u8]) -> Result<usize, Error> {
-        let end = storage.capacity() as u32;
+    fn estimate_frame_size_aligned(data: &[u8]) -> usize {
+        let len = data.len();
+        let mut result = 0;
 
-        // Handle reading into smaller buffer than the available contigious data
-        let len = core::cmp::min(data.len(), end.saturating_sub(self.read_head) as usize);
+        if len % WORD_SIZE_BYTES == 0 {
+            result = len;
+        } else {
+            let bytes_within_word = len % WORD_SIZE_BYTES;
+            let last_word_index = len.saturating_sub(bytes_within_word);
 
+            if len - bytes_within_word > 0 {
+                result += last_word_index;
+            }
+
+            if bytes_within_word == 1 && data[last_word_index] == COBS_SENTINEL_BYTE {
+                result += 1;
+            } else {
+                result += WORD_SIZE_BYTES;
+            }
+        }
+
+        result
+    }
+
+    fn is_area_empty(storage: &mut S, start: u32, end: u32) -> Result<bool, Error> {
+        for addr in (start..end).step_by(WORD_SIZE_BYTES) {
+            if !Self::is_word_empty(storage, addr)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn is_word_empty(storage: &mut S, addr: u32) -> Result<bool, Error> {
+        let mut word_buf = [0u8; WORD_SIZE_BYTES];
         storage
-            .try_read(self.read_head, &mut data[..len])
+            .try_read(addr, &mut word_buf)
             .map_err(|_| Error::StorageRead)?;
-
-        Ok(len)
+        Ok(u64::from_le_bytes(word_buf) == Self::EMPTY)
     }
 
     pub fn incr_read_marker(&mut self, storage: &mut S, inc: u32) {
@@ -270,40 +350,50 @@ where
             .map_err(|_| Error::StorageWrite)
     }
 
+    // Finds the starting word address of the biggest empty area in O(n) time
     fn seek_write_head(storage: &mut S) -> Result<u32, Error> {
         if !Self::check_magic(storage)? {
             return Ok(0);
         }
 
-        // Magic found, let's look for the TWO empty words
-        for addr in (WORD_SIZE_BYTES..storage.capacity() as usize).step_by(WORD_SIZE_BYTES) {
-            let mut buf = [0u8; WORD_SIZE_BYTES];
-            storage
-                .try_read(addr as u32, &mut buf)
-                .map_err(|_| Error::StorageRead)?;
-            let word1 = u64::from_le_bytes(buf);
-            storage
-                .try_read((addr + WORD_SIZE_BYTES) as u32, &mut buf)
-                .map_err(|_| Error::StorageRead)?;
-            let word2 = u64::from_le_bytes(buf);
+        let mut max_empty_area_size = 0usize;
+        let mut max_empty_area_start_addr: Option<u32> = None;
+        let mut current_empty_area_size = 0usize;
+        let mut current_empty_area_addr = 0u32;
 
-            if word1 == Self::EMPTY && word2 == Self::EMPTY {
-                return Ok(addr as u32);
+        for addr in (WORD_SIZE_BYTES..storage.capacity() as usize).step_by(WORD_SIZE_BYTES) {
+            if Self::is_word_empty(storage, addr as u32)? {
+                if current_empty_area_size == 0 {
+                    current_empty_area_addr = addr as u32;
+                }
+
+                current_empty_area_size += 1;
+            } else {
+                current_empty_area_size = 0;
+            }
+
+            if current_empty_area_size > max_empty_area_size {
+                max_empty_area_start_addr = Some(current_empty_area_addr);
+                max_empty_area_size = current_empty_area_size;
             }
         }
 
-        Ok(WORD_SIZE_BYTES as u32)
+        if let Some(area_addr) = max_empty_area_start_addr {
+            Ok(area_addr)
+        } else {
+            Ok(WORD_SIZE_BYTES as u32)
+        }
     }
 }
 
-pub struct LogManager<S: Storage> {
+pub struct LogManager<S: Storage + ErasableStorage> {
     inner: Consumer<'static, LogBufferSize>,
     pub(crate) helper: StorageHelper<S>,
 }
 
 impl<S> LogManager<S>
 where
-    S: Storage,
+    S: Storage + ErasableStorage,
 {
     /// Initialize a new LogManager.
     ///
@@ -358,41 +448,49 @@ where
         Self::retrieve_frames_helper(&mut self.helper, storage, buf)
     }
 
+    /// Scans storage area for COBS-encoded frames.
+    /// Skips sequences of `COBS_SENTINEL_BYTE`s of any length.
+    ///
+    /// Due to possible wrapping during writes, the frames may appear in random order.
+    /// It is recommended for frames contain a timestamp and to be sorted using it by a host application.
     pub fn retrieve_frames_helper(
         helper: &mut StorageHelper<S>,
         storage: &mut S,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
-        let read_len = helper.read_slice(storage, buf)?;
-        if read_len == 0 {
-            return Ok(0);
-        }
-
-        let mut frames = buf[..read_len]
-            .split(|x| *x == COBS_SENTINEL_BYTE)
-            .peekable();
         let mut bytes_written = 0;
-        let mut num_empty_frames = 0;
-        while let Some(frame) = frames.next() {
-            if frames.peek().is_some() {
-                let frame_len = frame.len() + 1;
 
-                if frame_len <= 1 {
-                    num_empty_frames += 1;
-                } else {
-                    num_empty_frames = 0;
+        loop {
+            let current_addr = helper.read_head;
+
+            if !StorageHelper::is_word_empty(storage, current_addr)? {
+                let mut word_buf = [0u8; WORD_SIZE_BYTES];
+                let bytes_to_read =
+                    core::cmp::min(WORD_SIZE_BYTES, storage.capacity() - current_addr as usize);
+                storage
+                    .try_read(current_addr, &mut word_buf[..bytes_to_read])
+                    .map_err(|_| Error::StorageRead)?;
+                for bytes in word_buf
+                    .split_inclusive(|x| *x == COBS_SENTINEL_BYTE)
+                    .filter(|f| !f.is_empty())
+                {
+                    let len = bytes.len();
+                    buf[bytes_written..(bytes_written + len)].copy_from_slice(&bytes);
+                    bytes_written += len;
                 }
 
-                if num_empty_frames >= 8 {
-                    helper.decr_read_marker((WORD_SIZE_BYTES - 1) as u32);
-                    bytes_written -= WORD_SIZE_BYTES - 1;
-                    break;
-                }
+                helper.incr_read_marker(storage, bytes_to_read as u32);
+            } else {
+                helper.incr_read_marker(storage, WORD_SIZE_BYTES as u32);
+            }
 
-                helper.incr_read_marker(storage, frame_len as u32);
-                bytes_written += frame_len;
+            if bytes_written >= buf.len()
+                || current_addr + WORD_SIZE_BYTES as u32 >= storage.capacity() as u32
+            {
+                break;
             }
         }
+
         Ok(bytes_written)
     }
 }
@@ -402,6 +500,14 @@ mod test {
     use super::*;
     use crate::pseudo_flash::PseudoFlashStorage;
     use core::ptr::NonNull;
+    use embedded_storage::{ErasableStorage, ReadStorage};
+    use lazy_static::lazy_static;
+    use std::sync::Mutex;
+
+    // Log manager tests have to run sequentially as they're accessing a global logger
+    lazy_static! {
+        static ref TEST_MUTEX: Mutex<()> = Mutex::new(());
+    }
 
     fn get_logger<'a>() -> Option<NonNull<dyn defmt::Write>> {
         #[cfg(not(feature = "rtt"))]
@@ -442,6 +548,11 @@ mod test {
                 if (bi + 1) % WORD_SIZE_BYTES == 0 {
                     write!(bytes_str, "|  ").ok();
                 }
+            }
+
+            // Draw page boundary
+            if i > 0 && i % PseudoFlashStorage::ERASE_SIZE as usize == 0 {
+                writeln!(s, "{}", "-".repeat(bytes_str.trim().len())).ok();
             }
 
             writeln!(s, "{}", bytes_str.trim()).ok();
@@ -526,13 +637,14 @@ mod test {
 
         // Check the case #1
         let mut buf = [0u8; 24];
-        sh.read_slice(&mut storage, &mut buf[..WORD_SIZE_BYTES])
+        storage
+            .try_read(sh.read_head, &mut buf[..WORD_SIZE_BYTES])
             .unwrap();
         sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
         assert!(matches!(buf, [0x00, 0x11, 0x22, 0x33, 0xFF, ..]));
 
         // Check the case #2
-        sh.read_slice(&mut storage, &mut buf).unwrap();
+        storage.try_read(sh.read_head, &mut buf).unwrap();
         sh.incr_read_marker(&mut storage, WORD_SIZE_BYTES as u32);
         assert!(matches!(
             buf,
@@ -540,7 +652,7 @@ mod test {
         ));
 
         // Check the case #3
-        sh.read_slice(&mut storage, &mut buf).unwrap();
+        storage.try_read(sh.read_head, &mut buf).unwrap();
         sh.incr_read_marker(&mut storage, (2 * WORD_SIZE_BYTES) as u32);
         assert!(matches!(
             buf,
@@ -604,14 +716,79 @@ mod test {
     }
 
     #[test]
-    fn log_manager() {
+    fn wrap_around() {
+        const NUM_PAGES: usize = 4;
+        const PAGE_SIZE: usize = PseudoFlashStorage::ERASE_SIZE as usize;
+
         let mut storage = PseudoFlashStorage {
-            buf: &mut [COBS_SENTINEL_BYTE; 256],
+            buf: &mut [COBS_SENTINEL_BYTE; PAGE_SIZE * NUM_PAGES],
+            ..Default::default()
+        };
+
+        let mut sh = StorageHelper::try_new(&mut storage).unwrap();
+
+        for i in 0..NUM_PAGES {
+            if i == 0 {
+                // Write the whole page except for bytes reserved for magic word
+                sh.write_slice(&mut storage, &[i as u8; PAGE_SIZE - WORD_SIZE_BYTES])
+                    .unwrap();
+            } else {
+                sh.write_slice(&mut storage, &[i as u8; PAGE_SIZE]).unwrap();
+            }
+        }
+
+        // Now trigger the very first wrap-around
+        sh.write_slice(&mut storage, &[0xAA; WORD_SIZE_BYTES])
+            .unwrap();
+
+        // Write some data until we hit the next page which is filled with previous data
+        sh.write_slice(&mut storage, &[0xBB; PAGE_SIZE - 2 * WORD_SIZE_BYTES])
+            .unwrap();
+
+        // Write some more data that won't fit since the page is filled,
+        // so the next page have to be erased
+        sh.write_slice(&mut storage, &[0xCC; 4]).unwrap();
+
+        sh.write_slice(&mut storage, &[0xDD; PAGE_SIZE / 2])
+            .unwrap();
+
+        // Write something that won't fit the page so it has to be moved
+        // to the next page (and that page have to be erased first)
+        sh.write_slice(&mut storage, &[0xEE; PAGE_SIZE / 2])
+            .unwrap();
+
+        // Reinitialize the storage to check how it finds the biggest empty area
+        // to place the writing head to
+        let mut sh = StorageHelper::try_new(&mut storage).unwrap();
+
+        // Write a ton of data to the storage, should wrap multiple times
+        // without any errors
+        for i in 1..254 {
+            sh.write_slice(&mut storage, &[i as u8; WORD_SIZE_BYTES])
+                .unwrap();
+        }
+
+        // Test the whole page write one more
+        sh.write_slice(&mut storage, &[0x00; PAGE_SIZE]).unwrap();
+
+        // Some more data again
+        for _ in 1..16 {
+            sh.write_slice(&mut storage, &[0xAA as u8; WORD_SIZE_BYTES])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn log_manager() {
+        let _guard = TEST_MUTEX.lock().ok(); // Ensure that test is running sequentially
+
+        let mut storage = PseudoFlashStorage {
+            buf: &mut [COBS_SENTINEL_BYTE; 128],
             ..Default::default()
         };
 
         static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
-        let mut read_data = [0x00; 256];
+        let mut read_data = [0x00; 1024];
 
         let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
 
@@ -670,6 +847,62 @@ mod test {
             frames.len(),
             "Not all of the frames were read"
         );
+    }
+
+    #[test]
+    fn log_manager_wrap() {
+        let _guard = TEST_MUTEX.lock().ok(); // Ensure that test is running sequentially
+
+        const NUM_PAGES: usize = 3;
+        const PAGE_SIZE: usize = PseudoFlashStorage::ERASE_SIZE as usize;
+
+        let mut storage = PseudoFlashStorage {
+            buf: &mut [COBS_SENTINEL_BYTE; PAGE_SIZE * NUM_PAGES],
+            ..Default::default()
+        };
+
+        static BUF: LogBuffer = BBBuffer(ConstBBBuffer::new());
+        let mut read_data = [0x00; 1024];
+
+        unsafe {
+            LOGPRODUCER = None;
+        };
+        let mut log = LogManager::try_new(&BUF, &mut storage).unwrap();
+
+        let frames = [
+            vec![0x01; 30],
+            vec![0x02; 30],
+            vec![0x03; 30],
+            vec![0x04; 30],
+            vec![0x05; 30],
+            vec![0x06; 64],
+            vec![0x07; 64],
+            vec![0x08; 30],
+            vec![0x09; 30],
+            vec![0x0A; 30],
+            vec![0x0B; 30],
+            vec![0x0C; 30],
+        ];
+
+        for frame in frames.iter() {
+            handle().start_encoder().unwrap();
+            unsafe { get_logger().unwrap().as_mut() }.write(frame);
+            handle().finalize_encoder().unwrap();
+
+            log.drain_storage(&mut storage).unwrap();
+        }
+
+        let len = log.retrieve_frames(&mut storage, &mut read_data).unwrap();
+
+        for frame in read_data[..len]
+            .split_mut(|b| *b == COBS_SENTINEL_BYTE)
+            .filter(|f| f.len() >= 1)
+        {
+            for b in frame.iter_mut() {
+                *b ^= 0xFF;
+            }
+            rzcobs::decode(frame).unwrap();
+        }
     }
 
     // From rzCOBS docs:
