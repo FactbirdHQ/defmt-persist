@@ -894,17 +894,14 @@ mod test {
 
         let len = log.retrieve_frames(&mut storage, &mut read_data).unwrap();
 
-        let mut num_frames_read = 0;
-        for (i, frame) in read_data[..len]
+        for frame in read_data[..len]
             .split_mut(|b| *b == COBS_SENTINEL_BYTE)
             .filter(|f| f.len() >= 1)
-            .enumerate()
         {
             for b in frame.iter_mut() {
                 *b ^= 0xFF;
             }
-
-            let frame = rzcobs::decode(frame).unwrap();
+            rzcobs::decode(frame).unwrap();
         }
     }
 
